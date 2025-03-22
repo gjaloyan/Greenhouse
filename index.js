@@ -5,7 +5,7 @@ import cors from 'cors';
 
 import {registerValidation, loginValidation,} from './validations/validations.js';
 import {handleValidationErrors, checkAuth} from './utils/index.js';
-import {UserController, SensorsController} from './controllers/index.js';
+import {UserController, SensorsController, RelayController} from './controllers/index.js';
 
 
 mdb
@@ -56,6 +56,7 @@ app.get('/auth/me', checkAuth, UserController.getMe)
 
 
 app.get('/sensors', SensorsController.getSensors)
+app.get('/relay', RelayController.sendRelayCommand)
 
 
 

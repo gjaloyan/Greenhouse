@@ -74,10 +74,10 @@ const getSensors = async (req, res) => {
         await MQTTClient.publishToTopic('sensors/sht20/read', 'request');
         
         // Ждем некоторое время, чтобы получить актуальные данные
-        await new Promise(resolve => setTimeout(resolve, 2500));
+        await new Promise(resolve => setTimeout(resolve, 3000));
         
         // Проверяем, получили ли мы обновленные данные
-        if (lastSensorsData && (Date.now() - lastUpdateTime < 3500)) {
+        if (lastSensorsData && (Date.now() - lastUpdateTime < 4000)) {
             return res.json({
                 data: lastSensorsData,
                 cached: false,
