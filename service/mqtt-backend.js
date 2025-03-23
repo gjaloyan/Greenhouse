@@ -25,7 +25,7 @@ client.on('connect', () => {
 
 client.on('message', (topic, message) => {
     const messageStr = message.toString();
-    console.log(`Received message on ${topic}: ${messageStr}`);
+    // console.log(`Received message on ${topic}: ${messageStr}`);
     
     // Сохраняем последнее сообщение
     lastMessages.set(topic, {
