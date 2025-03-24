@@ -37,7 +37,7 @@ MQTTClient.subscribeToTopic('relay/status')
         console.error('Error subscribing to relay/status:', error);
     });
 
-// Initialize status for all relays
+// Initialize status for all relays yoyo
 Object.keys(relayConfig).forEach(relayId => {
   relayStatus.set(relayId, {
     state: 'unknown',
