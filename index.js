@@ -42,6 +42,7 @@ app.get('/', (req, res) => {
 })  
 
 
+// Auth routes
 app.post('/auth/login', loginValidation, handleValidationErrors, UserController.login)
 app.post('/auth/register', registerValidation, handleValidationErrors, UserController.register)
 app.get('/auth/me', checkAuth, UserController.getMe)
@@ -55,12 +56,21 @@ app.get('/auth/me', checkAuth, UserController.getMe)
 // app.get('/posts', PostController.getAll)
 
 
-app.get('/sensors', SensorsController.getSensors)
-app.get('/relay', RelayController.sendRelayCommand)
+// Sensor routes
+// Order matters! More specific routes must come before dynamic routes
+app.get('/sensors', SensorsController.getSensorList)    
+app.get('/sensors/data', SensorsController.getAllSensors)
+app.get('/sensors/:sensorId', SensorsController.getSensor)
 
-
-
-
+// Relay routes - updated for multiple relays
+app.get('/relay', RelayController.getRelayList)
+app.get('/relay/status', RelayController.getRelayStatus)
+app.get('/relay/:relayId/status', RelayController.getRelayStatus)
+app.post('/relay/:relayId/on', RelayController.sendRelayCommandOn)
+app.post('/relay/:relayId/off', RelayController.sendRelayCommandOff)
+// Legacy routes for backward compatibility
+app.post('/relay/on', RelayController.sendRelayCommandOn)
+app.post('/relay/off', RelayController.sendRelayCommandOff)
 
 
 app.listen(5555, (err) => {

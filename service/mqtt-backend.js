@@ -9,10 +9,10 @@ const options = {
     clean: true // Set to false if you want to maintain session state
 };
 
-// Хранилище для обработчиков сообщений по топикам
+// Message handlers repository by topic
 const messageHandlers = new Map();
 
-// Последние полученные сообщения по топикам
+// Last received messages by topic
 const lastMessages = new Map();
 
 // Create a client instance
@@ -25,15 +25,22 @@ client.on('connect', () => {
 
 client.on('message', (topic, message) => {
     const messageStr = message.toString();
-    // console.log(`Received message on ${topic}: ${messageStr}`);
     
-    // Сохраняем последнее сообщение
+    // Check for control messages or special formats that don't need to be logged
+    const isControlMessage = messageStr === 'request' || messageStr.includes('_OFF') || 
+                             messageStr.match(/^relay\d+$/);
+    
+    if (!isControlMessage) {
+        console.log(`Received message on ${topic}: "${messageStr.substring(0, 100)}${messageStr.length > 100 ? '...' : ''}"`);
+    }
+    
+    // Save the last message
     lastMessages.set(topic, {
         message: messageStr,
         timestamp: Date.now()
     });
     
-    // Вызываем все обработчики для этого топика
+    // Call all handlers for this topic
     if (messageHandlers.has(topic)) {
         const handlers = messageHandlers.get(topic);
         handlers.forEach(handler => {
@@ -52,6 +59,10 @@ client.on('error', (err) => {
 
 client.on('close', () => {
     console.log('Connection to MQTT broker closed');
+});
+
+client.on('reconnect', () => {
+    console.log('Attempting to reconnect to MQTT broker...');
 });
 
 // Function to subscribe to a topic
@@ -78,27 +89,27 @@ function publishToTopic(topic, message) {
                 console.error('Error publishing message:', err);
                 reject({success: false, error: err});
             } else {
-                console.log('Message published successfully - topic: ' + topic + ', message: ' + messageStr);
+                console.log(`Published to ${topic}: "${messageStr}"`);
                 resolve({success: true, topic: topic});
             }
         });
     });
 }
 
-// Функция для регистрации обработчика сообщений для конкретного топика
+// Function to register a message handler for a specific topic
 function onMessage(topic, callback) {
     if (!messageHandlers.has(topic)) {
         messageHandlers.set(topic, []);
     }
     messageHandlers.get(topic).push(callback);
     
-    // Подписываемся на топик, если еще не подписаны
+    // Subscribe to the topic if not already subscribed
     subscribeToTopic(topic).catch(err => {
         console.error(`Failed to subscribe to topic ${topic}:`, err);
     });
 }
 
-// Функция для получения последнего сообщения из топика
+// Function to get the last message from a topic
 function getLastMessage(topic) {
     return lastMessages.get(topic) || null;
 }
@@ -108,11 +119,17 @@ function isConnected() {
     return client.connected;
 }
 
+// Function to get a list of all active subscriptions
+function getActiveSubscriptions() {
+    return Object.keys(client.subscriptions || {});
+}
+
 // Export the functions
 export default {
     subscribeToTopic,
     publishToTopic,
     onMessage,
     getLastMessage,
-    isConnected
+    isConnected,
+    getActiveSubscriptions
 };
