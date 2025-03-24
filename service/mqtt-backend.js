@@ -1,11 +1,11 @@
 import MQTT from 'mqtt';
 
 // Configuration
-const brokerUrl = ''; // Replace with your MQTT broker URL
+const brokerUrl = 'mqtt://34.71.239.197'; // Replace with your MQTT broker URL
 const options = {
-    clientId: '', // Unique client ID
-    username: '', // Your username if required
-    password: '', // Your password if required
+    clientId: 'ESP82677', // Unique client ID
+    username: 'gjaloyan', // Your username if required
+    password: '26839269', // Your password if required
     clean: true // Set to false if you want to maintain session state
 };
 
