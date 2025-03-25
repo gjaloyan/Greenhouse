@@ -5,7 +5,7 @@ import cors from 'cors';
 
 import {registerValidation, loginValidation,} from './validations/validations.js';
 import {handleValidationErrors, checkAuth} from './utils/index.js';
-import {UserController, SensorsController, RelayController} from './controllers/index.js';
+import {UserController, SensorsController, RelayController, VentilationController} from './controllers/index.js';
 
 
 mdb
@@ -71,6 +71,11 @@ app.post('/relay/:relayId/off', RelayController.sendRelayCommandOff)
 // Legacy routes for backward compatibility
 app.post('/relay/on', RelayController.sendRelayCommandOn)
 app.post('/relay/off', RelayController.sendRelayCommandOff)
+
+// Ventilation routes
+app.get('/ventilation/status', VentilationController.getVentilationStatus)
+app.post('/ventilation/on', VentilationController.turnOnVentilation)
+app.post('/ventilation/off', VentilationController.turnOffVentilation)
 
 
 app.listen(5555, (err) => {
