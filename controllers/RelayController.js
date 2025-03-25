@@ -573,5 +573,6 @@ export default {
   sendRelayCommandOff,
   getRelayStatus,
   getSpecificRelayStatus,
-  getRelayList
+  getRelayList,
+  checkConnection
 }       

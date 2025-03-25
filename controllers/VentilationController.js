@@ -50,6 +50,14 @@ async function getVentilationState() {
  * Turn on ventilation
  */
 const turnOnVentilation = async (req, res) => {
+
+    if (!await relayService.checkConnection()) {
+        return res.status(503).json({
+            message: 'MQTT server unavailable',
+            success: false
+        });
+    }
+
     try {
         // Get current status
         const status = await getVentilationState();
@@ -94,6 +102,14 @@ const turnOnVentilation = async (req, res) => {
  * Turn off ventilation
  */
 const turnOffVentilation = async (req, res) => {
+
+    if (!await relayService.checkConnection()) {
+        return res.status(503).json({
+            message: 'MQTT server unavailable',
+            success: false
+        });
+    }
+
     try {
         // Get current status
         const status = await getVentilationState();
