@@ -65,7 +65,7 @@ app.get('/sensors/:sensorId', SensorsController.getSensor)
 // Relay routes - updated for multiple relays
 app.get('/relay', RelayController.getRelayList)
 app.get('/relay/status', RelayController.getRelayStatus)
-app.get('/relay/:relayId/status', RelayController.getRelayStatus)
+app.get('/relay/:relayId/status', RelayController.getSpecificRelayStatus)
 app.post('/relay/:relayId/on', RelayController.sendRelayCommandOn)
 app.post('/relay/:relayId/off', RelayController.sendRelayCommandOff)
 // Legacy routes for backward compatibility

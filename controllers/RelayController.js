@@ -1,348 +1,425 @@
 import MQTTClient from '../service/mqtt-backend.js';
 
+// ============ CONSTANTS ============
+
 // Relay configuration
 const relayConfig = {
-  'relay1': {
-    description: 'Relay 1',
-    topic: 'relay/command',
-    statusTopic: 'relay/status'
-  },
-  'relay2': {
-    description: 'Relay 2',
-    topic: 'relay/command',
-    statusTopic: 'relay/status'
-  },
-  'relay3': {
-    description: 'Relay 3',
-    topic: 'relay/command',
-    statusTopic: 'relay/status'
-  },
-  'relay4': {
-    description: 'Relay 4',
-    topic: 'relay/command',
-    statusTopic: 'relay/status'
+  'r1': { name: 'Relay 1', description: 'Relay 1', id: 1 },
+  'r2': { name: 'Relay 2', description: 'Relay 2', id: 2 },
+  'r3': { name: 'Relay 3', description: 'Relay 3', id: 3 },
+  'r4': { name: 'Relay 4', description: 'Relay 4', id: 4 }
+};
+
+// MQTT Topics
+const TOPICS = {
+  COMMAND: 'relay/command',
+  STATUS: 'relay/status',
+  STATUS_REQUEST: 'relay/status/get'
+};
+
+// Response timeouts
+const TIMEOUT = {
+  VERIFICATION: 500,   // Wait time after sending command before checking status
+  ESP_RESPONSE: 2000   // Max wait time for ESP8266 to respond
+};
+
+// ============ STATE MANAGEMENT ============
+
+// Store latest states received from ESP8266
+const relayStates = new Map();
+
+// Initialize with unknown states
+Object.keys(relayConfig).forEach(relayId => {
+  relayStates.set(relayId, { state: 'unknown', lastUpdate: 0 });
+});
+
+/**
+ * Get current state of a relay from local cache
+ * Note: This only returns the last known state from ESP8266
+ */
+function getRelayState(relayId) {
+  return relayStates.get(relayId)?.state || 'unknown';
+}
+
+/**
+ * Update the state of a relay in local cache
+ * Only used when ESP8266 reports a state change
+ */
+function updateRelayState(relayId, state) {
+  if (relayConfig[relayId]) {
+    relayStates.set(relayId, {
+      state: state,
+      lastUpdate: Date.now()
+    });
+    return true;
+  }
+  return false;
+}
+
+// ============ MQTT COMMUNICATION ============
+
+/**
+ * Ensure MQTT connection is active
+ */
+async function checkConnection() {
+  if (MQTTClient.isConnected()) return true;
+  console.log('MQTT disconnected. Cannot perform operation.');
+  return false;
+}
+
+/**
+ * Request updated status from ESP8266 and wait for response
+ * This is the primary way to get the actual relay state from device
+ */
+async function requestRelayStatus(target = 'all') {
+  if (!await checkConnection()) {
+    throw new Error('MQTT server unavailable');
+  }
+  
+  // Clear any existing state data that's older than 5 seconds
+  if (target === 'all') {
+    Object.keys(relayConfig).forEach(relayId => {
+      const status = relayStates.get(relayId);
+      if (Date.now() - status.lastUpdate > 5000) {
+        status.state = 'unknown';
+      }
+    });
+  } else if (relayConfig[target]) {
+    const status = relayStates.get(target);
+    if (Date.now() - status.lastUpdate > 5000) {
+      status.state = 'unknown';
+    }
+  }
+  
+  // Request fresh status from device
+  console.log(`Requesting relay status from ESP8266: ${target}`);
+  await MQTTClient.publishToTopic(TOPICS.STATUS_REQUEST, target);
+  
+  // Wait for ESP8266 to respond
+  await new Promise(resolve => setTimeout(resolve, TIMEOUT.ESP_RESPONSE));
+  
+  // Return the state (may still be 'unknown' if device didn't respond)
+  if (target === 'all') {
+    const states = {};
+    Object.keys(relayConfig).forEach(relayId => {
+      states[relayId] = getRelayState(relayId);
+    });
+    return states;
+  } else {
+    return getRelayState(target);
+  }
+}
+
+/**
+ * Send command to ESP8266 to control a relay and get the resulting state
+ * Only the ESP8266's reported state is considered authoritative
+ */
+async function controlRelay(relayId, state) {
+  // Validate inputs
+  if (!relayConfig[relayId]) {
+    throw new Error(`Relay '${relayId}' not found`);
+  }
+  
+  if (!await checkConnection()) {
+    throw new Error('MQTT server unavailable');
+  }
+  
+  // Format command according to ESP8266 expectations (r1 for ON, r1_OFF for OFF)
+  const command = state === 'ON' ? relayId : `${relayId}_OFF`;
+  
+  // Get initial state for comparison
+  const initialState = await requestRelayStatus(relayId);
+  console.log(`Initial state of ${relayId} is ${initialState}`);
+  
+  // Send command to ESP8266
+  const result = await MQTTClient.publishToTopic(TOPICS.COMMAND, command);
+  if (!result.success) {
+    throw new Error('Failed to send relay command');
+  }
+  
+  console.log(`Command sent to ${relayId}: ${state}, waiting for ESP8266 to process...`);
+  
+  // Wait before verification to give ESP8266 time to process command
+  await new Promise(resolve => setTimeout(resolve, TIMEOUT.VERIFICATION));
+  
+  // Request and verify the actual state from the device
+  // We don't update state locally - we only trust what the ESP8266 reports
+  try {
+    console.log(`Verifying new state of ${relayId} from ESP8266...`);
+    
+    // Request latest state directly from ESP8266
+    const actualState = await requestRelayStatus(relayId);
+    const stateMatch = (actualState.toUpperCase() === state.toUpperCase());
+    
+    if (!stateMatch) {
+      console.warn(`⚠️ Relay state mismatch: requested ${state}, but ESP8266 reports ${actualState}`);
+    } else {
+      console.log(`✅ Relay ${relayId} state confirmed by ESP8266: ${actualState}`);
+    }
+    
+    // Return full details with the ESP8266-reported state
+    return {
+      relayId,
+      name: relayConfig[relayId].name,
+      id: relayConfig[relayId].id,
+      state: actualState,
+      requestedState: state,
+      stateMatch,
+      success: true,
+      ...(stateMatch ? {} : { warning: `State mismatch: requested ${state}, but ESP8266 reports ${actualState}` })
+    };
+  } catch (error) {
+    console.error(`Failed to verify relay state: ${error.message}`);
+    
+    // Even if verification fails, return the same object format
+    return {
+      relayId,
+      name: relayConfig[relayId].name,
+      id: relayConfig[relayId].id,
+      state: 'unknown',
+      requestedState: state,
+      stateMatch: false,
+      stateVerified: false,
+      success: false,
+      warning: "State verification failed - ESP8266 did not respond"
+    };
+  }
+}
+
+// ============ MQTT MESSAGE HANDLING ============
+
+// Setup MQTT subscription
+console.log('Setting up relay status listener...');
+MQTTClient.subscribeToTopic(TOPICS.STATUS);
+
+// Handle status updates from ESP8266
+MQTTClient.onMessage(TOPICS.STATUS, (topic, message) => {
+  console.log(`Received relay status from ESP8266: ${message}`);
+  
+  try {
+    // Try to parse as JSON first
+    const status = JSON.parse(message);
+    
+    // Handle object with relay states
+    if (typeof status === 'object' && !Array.isArray(status)) {
+      Object.entries(status).forEach(([relayId, state]) => {
+        if (updateRelayState(relayId, state)) {
+          console.log(`ESP8266 reports: Relay ${relayId} is ${state}`);
+        }
+      });
+      return;
+    }
+  } catch (error) {
+    // Not JSON, handle as text
+    const text = message.toString().trim();
+    
+    // Check for relay ID pattern (r1, r2, etc.)
+    const relayMatch = text.match(/(r[1-4])/i);
+    if (relayMatch) {
+      const relayId = relayMatch[1].toLowerCase();
+      
+      // Determine state based on message content
+      let state = "unknown";
+      if (text === relayId) state = "ON";
+      else if (text.includes(relayId + "_OFF")) state = "OFF";
+      else if (text.includes("ON")) state = "ON";
+      else if (text.includes("OFF")) state = "OFF";
+      
+      if (updateRelayState(relayId, state)) {
+        console.log(`ESP8266 reports: Relay ${relayId} is ${state}`);
+      }
+    } 
+    // Handle simple ON/OFF messages
+    else if (text.toUpperCase() === 'ON' || text.toUpperCase() === 'OFF') {
+      updateRelayState('r1', text.toUpperCase());
+      console.log(`ESP8266 reports: Relay r1 is ${text.toUpperCase()}`);
+    }
+  }
+});
+
+// ============ HTTP CONTROLLERS ============
+
+/**
+ * Get status of all relays directly from ESP8266
+ */
+const getRelayStatus = async (req, res) => {
+  try {
+    if (!await checkConnection()) {
+      return res.status(503).json({
+        message: 'MQTT server unavailable',
+        success: false
+      });
+    }
+    
+    // Always force a fresh request to the ESP8266
+    const forceRefresh = req.query.refresh !== 'false';
+    
+    if (forceRefresh) {
+      console.log('Forcing refresh of relay states from ESP8266');
+    }
+    
+    // Get states directly from ESP8266
+    const states = await requestRelayStatus('all');
+    
+    // Return state object
+    return res.json({
+      states,
+      source: 'ESP8266',
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    console.error('Error getting relay status:', error);
+    return res.status(500).json({
+      message: error.message,
+      success: false
+    });
   }
 };
 
-// Track relay statuses
-const relayStatus = new Map();
-
-// Initialize MQTT subscription for relay status
-console.log('Setting up MQTT handlers for relays...');
-MQTTClient.subscribeToTopic('relay/status')
-    .then(result => {
-        console.log(`Subscribed to relay/status: ${result.success ? 'success' : 'error'}`);
-    })
-    .catch(error => {
-        console.error('Error subscribing to relay/status:', error);
-    });
-
-// Initialize status for all relays yoyo
-Object.keys(relayConfig).forEach(relayId => {
-  relayStatus.set(relayId, {
-    state: 'unknown',
-    lastUpdate: 0
-  });
-});
-
-// Listen for status updates
-MQTTClient.onMessage('relay/status', (topic, message) => {
-    try {
-        // First try to parse as JSON
-        const status = JSON.parse(message);
-        
-        // If the message contains statuses for multiple relays
-        if (typeof status === 'object' && !Array.isArray(status)) {
-            Object.entries(status).forEach(([relayId, state]) => {
-                if (relayConfig[relayId]) {
-                    relayStatus.set(relayId, {
-                        state: state,
-                        lastUpdate: Date.now()
-                    });
-                }
-            });
-            console.log(`Relay statuses updated: ${JSON.stringify(Object.fromEntries(relayStatus))}`);
-        } else {
-            // Legacy format - update all relays with the same status
-            Object.keys(relayConfig).forEach(relayId => {
-                relayStatus.set(relayId, {
-                    state: status.toString(),
-                    lastUpdate: Date.now()
-                });
-            });
-            console.log(`All relay statuses set to: ${status.toString()}`);
-        }
-    } catch (error) {
-        // If not JSON, try to handle raw message formats
-        console.log(`Raw relay status message: "${message}"`);
-        const statusText = message.toString().trim();
-        
-        // Check if message contains a specific relay ID
-        const relayMatch = statusText.match(/(relay\d+)/i);
-        if (relayMatch && relayMatch[1]) {
-            const relayId = relayMatch[1].toLowerCase();
-            
-            if (relayConfig[relayId]) {
-                // Check if message indicates an ON state
-                let state = "unknown";
-                
-                if (statusText === relayId) {
-                    // Just the relay ID means ON
-                    state = "ON";
-                } else if (statusText.includes(relayId + "_OFF")) {
-                    // RelayID_OFF indicates OFF
-                    state = "OFF";
-                } else if (statusText.includes("on") || statusText.includes("ON")) {
-                    state = "ON";
-                } else if (statusText.includes("off") || statusText.includes("OFF")) {
-                    state = "OFF";
-                }
-                
-                relayStatus.set(relayId, {
-                    state: state,
-                    lastUpdate: Date.now()
-                });
-                
-                console.log(`Relay ${relayId} status updated to: ${state}`);
-            }
-        } else {
-            // If no specific relay mentioned, check for general ON/OFF state
-            let affectedRelay = null;
-            
-            // Special case: handle if message is just 'ON' or 'OFF'
-            if (statusText.toUpperCase() === 'ON' || statusText.toUpperCase() === 'OFF') {
-                // Default to relay1 for generic ON/OFF messages
-                affectedRelay = 'relay1';
-                relayStatus.set(affectedRelay, {
-                    state: statusText.toUpperCase(),
-                    lastUpdate: Date.now()
-                });
-                console.log(`Default relay (${affectedRelay}) set to ${statusText.toUpperCase()}`);
-            } else {
-                // Check for ON/OFF mentions in the message for all relays
-                Object.keys(relayConfig).forEach(relayId => {
-                    if (statusText.toLowerCase().includes('on')) {
-                        relayStatus.set(relayId, {
-                            state: 'ON',
-                            lastUpdate: Date.now()
-                        });
-                    } else if (statusText.toLowerCase().includes('off')) {
-                        relayStatus.set(relayId, {
-                            state: 'OFF',
-                            lastUpdate: Date.now()
-                        });
-                    }
-                });
-            }
-        }
-    }
-});
-
 /**
- * Send command to control a specific relay
- * @param {string} relayId - ID of the relay to control
- * @param {string} state - Desired state (ON or OFF)
+ * Get status of a specific relay directly from ESP8266
  */
-const controlRelay = async (relayId, state) => {
+const getSpecificRelayStatus = async (req, res) => {
+  try {
+    const relayId = req.params.relayId;
+    
     if (!relayConfig[relayId]) {
-        throw new Error(`Relay '${relayId}' not found`);
+      return res.status(404).json({
+        message: `Relay '${relayId}' not found`,
+        success: false
+      });
     }
     
-    // For ON command, we just send the relay ID
-    // For OFF command, we send relay ID with OFF suffix
-    const command = state === 'ON' ? relayId : `${relayId}_OFF`;
-    
-    const publishResult = await MQTTClient.publishToTopic(
-        relayConfig[relayId].topic, 
-        command
-    );
-    
-    console.log(`Sent relay command: ${command} to topic: ${relayConfig[relayId].topic}`);
-    
-    if (!publishResult.success) {
-        throw new Error('Failed to send relay command');
+    if (!await checkConnection()) {
+      return res.status(503).json({
+        message: 'MQTT server unavailable',
+        success: false
+      });
     }
     
-    // Update local status
-    relayStatus.set(relayId, {
-        state: state,
-        lastUpdate: Date.now()
+    // Always request fresh status from ESP8266
+    const state = await requestRelayStatus(relayId);
+    const lastUpdate = relayStates.get(relayId)?.lastUpdate || 0;
+    
+    // Return comprehensive relay information
+    return res.json({
+      relayId,
+      name: relayConfig[relayId].name,
+      description: relayConfig[relayId].description,
+      id: relayConfig[relayId].id,
+      state,
+      lastUpdate,
+      source: 'ESP8266'
     });
+  } catch (error) {
+    console.error(`Error getting relay status:`, error);
+    return res.status(500).json({
+      message: error.message,
+      success: false
+    });
+  }
+};
+
+/**
+ * Control a relay (ON or OFF) and get status from ESP8266
+ */
+async function controlRelayEndpoint(req, res, state) {
+  const relayId = req.params.relayId || 'r1';
+  
+  try {
+    if (!relayConfig[relayId]) {
+      return res.status(404).json({
+        message: `Relay '${relayId}' not found`,
+        success: false
+      });
+    }
     
-    return {
-        relayId,
-        command,
-        state,
-        success: true
+    // Send command and get verified state from ESP8266
+    const result = await controlRelay(relayId, state);
+    
+    // Prepare response based on ESP8266 verification
+    const response = {
+      message: `Command sent to ${result.name}: ${state}. ESP8266 reports: ${result.state}`,
+      relayId,
+      name: result.name,
+      id: result.id,
+      state: result.state,
+      requestedState: result.requestedState,
+      success: result.success,
+      source: 'ESP8266'
     };
-};
+    
+    // Add warning information if needed
+    if (result.warning) response.warning = result.warning;
+    if (result.stateMatch === false) response.stateMatch = false;
+    
+    return res.json(response);
+  } catch (error) {
+    console.error(`Error controlling relay:`, error);
+    return res.status(503).json({
+      message: error.message,
+      success: false
+    });
+  }
+}
 
 /**
- * Send command to turn a specific relay ON
+ * Turn a relay ON and get status from ESP8266
  */
-const sendRelayCommandOn = async (req, res) => {
-    try {
-        const relayId = req.params.relayId || req.body.relayId || 'relay1';
-        
-        // Validate relay ID
-        if (!relayConfig[relayId]) {
-            return res.status(404).json({
-                message: `Relay '${relayId}' not found`,
-                success: false
-            });
-        }
-        
-        const result = await controlRelay(relayId, 'ON');
-        
-        return res.json({ 
-            message: `${relayId} turned ON successfully`,
-            relayId: relayId,
-            state: 'ON',
-            success: true
-        });
-    } catch (error) {
-        console.error(`Error sending relay ON command:`, error);
-        return res.status(500).json({ 
-            message: 'Error sending relay command: ' + error.message,
-            success: false
-        });
-    }
-};
+const sendRelayCommandOn = (req, res) => controlRelayEndpoint(req, res, 'ON');
 
 /**
- * Send command to turn a specific relay OFF
+ * Turn a relay OFF and get status from ESP8266
  */
-const sendRelayCommandOff = async (req, res) => {
-    try {
-        const relayId = req.params.relayId || req.body.relayId || 'relay1';
-        
-        // Validate relay ID
-        if (!relayConfig[relayId]) {
-            return res.status(404).json({
-                message: `Relay '${relayId}' not found`,
-                success: false
-            });
-        }
-        
-        const result = await controlRelay(relayId, 'OFF');
-        
-        return res.json({ 
-            message: `${relayId} turned OFF successfully`,
-            relayId: relayId,
-            state: 'OFF',
-            success: true
-        });
-    } catch (error) {
-        console.error(`Error sending relay OFF command:`, error);
-        return res.status(500).json({ 
-            message: 'Error sending relay command: ' + error.message,
-            success: false
-        });
-    }
-};
+const sendRelayCommandOff = (req, res) => controlRelayEndpoint(req, res, 'OFF');
 
 /**
- * Get current status of all relays or a specific relay
+ * Get list of available relays with status from ESP8266
  */
-const getRelayStatus = async (req, res) => {
-    try {
-        const relayId = req.params.relayId || req.query.relayId;
-        const now = Date.now();
-        
-        // If specific relay was requested
-        if (relayId) {
-            if (!relayConfig[relayId]) {
-                return res.status(404).json({
-                    message: `Relay '${relayId}' not found`,
-                    success: false
-                });
-            }
-            
-            const status = relayStatus.get(relayId);
-            const isRecent = (now - status.lastUpdate) < 10000; // 10 seconds
-            
-            // Request fresh status if needed
-            if (!isRecent || status.state === 'unknown') {
-                await MQTTClient.publishToTopic('relay/status/get', relayId);
-                // Wait briefly for response
-                await new Promise(resolve => setTimeout(resolve, 2000));
-            }
-            
-            return res.json({
-                relayId: relayId,
-                state: relayStatus.get(relayId).state,
-                lastUpdate: relayStatus.get(relayId).lastUpdate,
-                fresh: isRecent
-            });
-        } else {
-            // Return status of all relays
-            const allStates = {};
-            let needsRefresh = false;
-            
-            Object.keys(relayConfig).forEach(id => {
-                const status = relayStatus.get(id);
-                const isRecent = (now - status.lastUpdate) < 10000;
-                
-                allStates[id] = {
-                    state: status.state,
-                    lastUpdate: status.lastUpdate,
-                    fresh: isRecent
-                };
-                
-                if (!isRecent || status.state === 'unknown') {
-                    needsRefresh = true;
-                }
-            });
-            
-            // Request refresh of all statuses if needed
-            if (needsRefresh) {
-                await MQTTClient.publishToTopic('relay/status/get', 'all');
-                // Wait briefly for response
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                
-                // Update the response with fresh data
-                Object.keys(relayConfig).forEach(id => {
-                    const status = relayStatus.get(id);
-                    allStates[id] = {
-                        state: status.state,
-                        lastUpdate: status.lastUpdate,
-                        fresh: (now - status.lastUpdate) < 3000
-                    };
-                });
-            }
-            
-            return res.json({
-                relays: allStates,
-                timestamp: now
-            });
-        }
-    } catch (error) {
-        console.error('Error getting relay status:', error);
-        return res.status(500).json({
-            message: 'Error getting relay status: ' + error.message,
-            success: false
-        });
-    }
-};
-
-/**
- * Get list of available relays
- */
-const getRelayList = (req, res) => {
-    const relayList = Object.entries(relayConfig).map(([id, config]) => ({
-        id,
-        description: config.description
+const getRelayList = async (req, res) => {
+  try {
+    // Always request fresh status from ESP8266
+    await requestRelayStatus('all');
+    
+    const relays = Object.entries(relayConfig).map(([relayId, config]) => ({
+      relayId,
+      name: config.name,
+      description: config.description,
+      id: config.id,
+      state: getRelayState(relayId),
+      lastUpdate: relayStates.get(relayId)?.lastUpdate || 0
     }));
     
     return res.json({
-        relays: relayList,
-        count: relayList.length
+      relays,
+      count: relays.length,
+      source: 'ESP8266'
     });
+  } catch (error) {
+    console.error(`Error getting relay list:`, error);
+    
+    // If we can't get states from ESP8266, still return the list
+    const relays = Object.entries(relayConfig).map(([relayId, config]) => ({
+      relayId,
+      name: config.name,
+      description: config.description,
+      id: config.id,
+      state: 'unknown',
+      error: 'Could not get state from ESP8266'
+    }));
+    
+    return res.json({
+      relays,
+      count: relays.length,
+      warning: 'Could not refresh states from ESP8266'
+    });
+  }
 };
 
 export default {
-    sendRelayCommandOn,
-    sendRelayCommandOff,
-    getRelayStatus,
-    getRelayList
+  sendRelayCommandOn,
+  sendRelayCommandOff,
+  getRelayStatus,
+  getSpecificRelayStatus,
+  getRelayList
 }       
