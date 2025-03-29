@@ -4,7 +4,7 @@ import relayService from './RelayController.js';
 const VENTILATION = {
     name: 'Ventilation Fan',
     description: 'Greenhouse ventilation system',
-    relayId: 'r5' // Ventilation is connected to relay 5
+    relayId: 'v1' // Ventilation is connected to relay 5
 };
 
 /**

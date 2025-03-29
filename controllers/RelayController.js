@@ -1,14 +1,14 @@
 import MQTTClient from '../service/mqtt-backend.js';
 
-// ============ CONSTANTS ============
+// ============ CONFIGURATION ============
 
-// Relay configuration
+// Relay definitions
 const relayConfig = {
   'r1': { name: 'Relay 1', description: 'Relay 1', id: 1 },
   'r2': { name: 'Relay 2', description: 'Relay 2', id: 2 },
   'r3': { name: 'Relay 3', description: 'Relay 3', id: 3 },
   'r4': { name: 'Relay 4', description: 'Relay 4', id: 4 },
-  'r5': { name: 'Ventilation', description: 'Ventilation', id: 5 }
+  'v1': { name: 'Ventilation', description: 'Ventilation Main', id: 5 }
 };
 
 // MQTT Topics
@@ -18,257 +18,160 @@ const TOPICS = {
   STATUS_REQUEST: 'relay/status/get'
 };
 
-// Response timeouts
+// Timeouts in milliseconds
 const TIMEOUT = {
-  VERIFICATION: 500,   // Wait time after sending command before checking status
-  ESP_RESPONSE: 2000   // Max wait time for ESP8266 to respond
+  VERIFICATION: 500,  // Wait time after command before verifying
+  ESP_RESPONSE: 2000  // Max wait for ESP8266 response
 };
+
+// Track device-reported relay states
+const relayStates = new Map(
+  Object.keys(relayConfig).map(id => [id, { state: 'unknown', lastUpdate: 0 }])
+);
 
 // ============ STATE MANAGEMENT ============
 
-// Store latest states received from ESP8266
-const relayStates = new Map();
-
-// Initialize with unknown states
-Object.keys(relayConfig).forEach(relayId => {
-  relayStates.set(relayId, { state: 'unknown', lastUpdate: 0 });
-});
-
-/**
- * Get current state of a relay from local cache
- * Note: This only returns the last known state from ESP8266
- */
 function getRelayState(relayId) {
   return relayStates.get(relayId)?.state || 'unknown';
 }
 
-/**
- * Update the state of a relay in local cache
- * Only used when ESP8266 reports a state change
- */
 function updateRelayState(relayId, state) {
-  if (relayConfig[relayId]) {
-    relayStates.set(relayId, {
-      state: state,
-      lastUpdate: Date.now()
-    });
-    return true;
-  }
-  return false;
+  if (!relayConfig[relayId]) return false;
+  
+  relayStates.set(relayId, {
+    state: state,
+    lastUpdate: Date.now()
+  });
+  return true;
 }
 
 // ============ MQTT COMMUNICATION ============
 
-/**
- * Ensure MQTT connection is active and attempt reconnection if possible
- */
 async function checkConnection() {
+  if (MQTTClient.isConnected()) return true;
+  
   try {
-    if (MQTTClient.isConnected()) return true;
-    
-    console.log('MQTT disconnected. Attempting to reconnect...');
-    
-    // Try to reconnect if the client provides reconnect functionality
     if (typeof MQTTClient.reconnect === 'function') {
-      try {
-        const reconnected = await MQTTClient.reconnect();
-        if (reconnected) {
-          console.log('Successfully reconnected to MQTT broker');
-          
-          // Re-subscribe to topics after reconnection
-          try {
-            await MQTTClient.subscribeToTopic(TOPICS.STATUS);
-            console.log('Re-subscribed to relay status topic');
-          } catch (subError) {
-            console.error('Failed to re-subscribe after reconnection:', subError);
-          }
-          
-          return true;
-        }
-      } catch (reconnectError) {
-        console.error('Reconnection attempt failed:', reconnectError);
+      const reconnected = await MQTTClient.reconnect();
+      if (reconnected) {
+        console.log('Reconnected to MQTT broker');
+        await MQTTClient.subscribeToTopic(TOPICS.STATUS);
+        return true;
       }
     }
-    
-    console.error('MQTT disconnected and reconnection failed/unavailable');
+    console.log('MQTT disconnected and reconnection failed');
     return false;
   } catch (error) {
-    console.error('Error checking MQTT connection:', error);
+    console.error('Connection check error:', error.message);
     return false;
   }
 }
 
-/**
- * Safely publish a message to MQTT with error handling
- */
-async function safePublish(topic, message) {
-  try {
-    if (!await checkConnection()) {
-      throw new Error('MQTT server unavailable');
-    }
+async function publishToESP(topic, message) {
+  if (!await checkConnection())
+    throw new Error('MQTT server unavailable');
     
-    const result = await MQTTClient.publishToTopic(topic, message);
-    if (!result || !result.success) {
-      throw new Error(`Failed to publish to ${topic}: ${result?.error || 'Unknown error'}`);
-    }
+  const result = await MQTTClient.publishToTopic(topic, message);
+  if (!result?.success)
+    throw new Error(`Failed to publish: ${result?.error || 'Unknown error'}`);
     
-    return result;
-  } catch (error) {
-    console.error(`Error publishing to ${topic}:`, error);
-    throw error;
-  }
+  return result;
 }
 
-/**
- * Request updated status from ESP8266 and wait for response
- * This is the primary way to get the actual relay state from device
- */
 async function requestRelayStatus(target = 'all') {
   try {
-    if (!await checkConnection()) {
-      throw new Error('MQTT server unavailable');
-    }
-    
-    // Clear any existing state data that's older than 5 seconds
+    // Clear stale data (older than 5s)
     if (target === 'all') {
-      Object.keys(relayConfig).forEach(relayId => {
-        const status = relayStates.get(relayId);
-        if (Date.now() - status.lastUpdate > 5000) {
+      Object.keys(relayConfig).forEach(id => {
+        const status = relayStates.get(id);
+        if (Date.now() - status.lastUpdate > 5000) 
           status.state = 'unknown';
-        }
       });
     } else if (relayConfig[target]) {
       const status = relayStates.get(target);
-      if (Date.now() - status.lastUpdate > 5000) {
+      if (Date.now() - status.lastUpdate > 5000)
         status.state = 'unknown';
-      }
     }
     
-    // Request fresh status from device
-    console.log(`Requesting relay status from ESP8266: ${target}`);
-    
+    // Request fresh status
     try {
-      await safePublish(TOPICS.STATUS_REQUEST, target);
-      
-      // Wait for ESP8266 to respond
-      await new Promise(resolve => setTimeout(resolve, TIMEOUT.ESP_RESPONSE));
-    } catch (publishError) {
-      console.error('Failed to request relay status:', publishError);
-      // Continue execution - we'll return the cached state
+      if (await checkConnection()) {
+        await publishToESP(TOPICS.STATUS_REQUEST, target);
+        await new Promise(resolve => setTimeout(resolve, TIMEOUT.ESP_RESPONSE));
+      }
+    } catch (error) {
+      console.error('Status request failed:', error.message);
     }
     
-    // Return the state (may still be 'unknown' if device didn't respond)
+    // Return current state
     if (target === 'all') {
-      const states = {};
-      Object.keys(relayConfig).forEach(relayId => {
-        states[relayId] = getRelayState(relayId);
-      });
-      return states;
-    } else {
-      return getRelayState(target);
+      return Object.keys(relayConfig).reduce((acc, id) => {
+        acc[id] = getRelayState(id);
+        return acc;
+      }, {});
     }
+    return getRelayState(target);
+    
   } catch (error) {
-    console.error(`Error in requestRelayStatus:`, error);
-    
-    // Even if there's an error, return a valid response
-    if (target === 'all') {
-      const states = {};
-      Object.keys(relayConfig).forEach(relayId => {
-        states[relayId] = 'unknown';
-      });
-      return states;
-    } else {
-      return 'unknown';
-    }
+    console.error('Status request error:', error.message);
+    return target === 'all' 
+      ? Object.keys(relayConfig).reduce((acc, id) => { 
+          acc[id] = 'unknown'; 
+          return acc; 
+        }, {})
+      : 'unknown';
   }
 }
 
-/**
- * Send command to ESP8266 to control a relay and get the resulting state
- * Only the ESP8266's reported state is considered authoritative
- */
 async function controlRelay(relayId, state) {
   try {
-    // Validate inputs
-    if (!relayConfig[relayId]) {
+    // Validate relay exists
+    if (!relayConfig[relayId]) 
       throw new Error(`Relay '${relayId}' not found`);
-    }
-    
-    if (!await checkConnection()) {
-      throw new Error('MQTT server unavailable');
-    }
-    
-    // Format command according to ESP8266 expectations (r1 for ON, r1_OFF for OFF)
+
+    // Format command for ESP8266
     const command = state === 'ON' ? relayId : `${relayId}_OFF`;
     
-    // Get initial state for comparison (but don't fail if this fails)
-    let initialState = 'unknown';
-    try {
-      initialState = await requestRelayStatus(relayId);
-      console.log(`Initial state of ${relayId} is ${initialState}`);
-    } catch (stateError) {
-      console.warn(`Could not get initial state: ${stateError.message}`);
-    }
+    // Try to get initial state
+    const initialState = await requestRelayStatus(relayId)
+      .catch(() => 'unknown');
+    console.log(`Initial state of ${relayId}: ${initialState}`);
     
-    // Send command to ESP8266
-    try {
-      await safePublish(TOPICS.COMMAND, command);
-      console.log(`Command sent to ${relayId}: ${state}, waiting for ESP8266 to process...`);
-    } catch (publishError) {
-      throw new Error(`Failed to send command: ${publishError.message}`);
-    }
+    // Send command
+    await publishToESP(TOPICS.COMMAND, command);
+    console.log(`Command sent to ${relayId}: ${state}`);
     
-    // Wait before verification to give ESP8266 time to process command
+    // Wait for ESP to process
     await new Promise(resolve => setTimeout(resolve, TIMEOUT.VERIFICATION));
     
-    // Request and verify the actual state from the device
-    try {
-      console.log(`Verifying new state of ${relayId} from ESP8266...`);
-      
-      // Request latest state directly from ESP8266
-      const actualState = await requestRelayStatus(relayId);
-      const stateMatch = (actualState.toUpperCase() === state.toUpperCase());
-      
-      if (!stateMatch) {
-        console.warn(`⚠️ Relay state mismatch: requested ${state}, but ESP8266 reports ${actualState}`);
-      } else {
-        console.log(`✅ Relay ${relayId} state confirmed by ESP8266: ${actualState}`);
-      }
-      
-      // Return full details with the ESP8266-reported state
-      return {
-        relayId,
-        name: relayConfig[relayId].name,
-        id: relayConfig[relayId].id,
-        state: actualState,
-        requestedState: state,
-        stateMatch,
-        success: true,
-        ...(stateMatch ? {} : { warning: `State mismatch: requested ${state}, but ESP8266 reports ${actualState}` })
-      };
-    } catch (verifyError) {
-      console.error(`Failed to verify relay state: ${verifyError.message}`);
-      
-      // Even if verification fails, return the same object format
-      return {
-        relayId,
-        name: relayConfig[relayId].name,
-        id: relayConfig[relayId].id,
-        state: 'unknown',
-        requestedState: state,
-        stateMatch: false,
-        stateVerified: false,
-        success: false,
-        warning: "State verification failed - ESP8266 did not respond"
-      };
-    }
-  } catch (error) {
-    console.error(`Relay control operation failed:`, error);
+    // Verify state change
+    const actualState = await requestRelayStatus(relayId);
+    const stateMatch = actualState.toUpperCase() === state.toUpperCase();
     
-    // Return failure response instead of throwing
+    if (!stateMatch) {
+      console.warn(`⚠️ State mismatch: requested ${state}, ESP reports ${actualState}`);
+    } else {
+      console.log(`✅ ${relayId} state confirmed: ${actualState}`);
+    }
+    
+    // Return result with ESP-reported state
     return {
       relayId,
-      name: relayConfig[relayId]?.name || 'Unknown Relay',
+      name: relayConfig[relayId].name,
+      id: relayConfig[relayId].id,
+      state: actualState,
+      requestedState: state,
+      stateMatch,
+      success: true,
+      ...(stateMatch ? {} : { 
+        warning: `State mismatch: requested ${state}, ESP reports ${actualState}` 
+      })
+    };
+  } catch (error) {
+    console.error(`Relay control failed:`, error.message);
+    return {
+      relayId,
+      name: relayConfig[relayId]?.name || 'Unknown',
       id: relayConfig[relayId]?.id || 0,
       state: 'unknown',
       requestedState: state,
@@ -278,66 +181,40 @@ async function controlRelay(relayId, state) {
   }
 }
 
-// ============ MQTT MESSAGE HANDLING ============
+// ============ MESSAGE HANDLING ============
 
-// Setup MQTT subscription with proper error handling
+// Set up subscription
 console.log('Setting up relay status listener...');
 MQTTClient.subscribeToTopic(TOPICS.STATUS)
-  .then(result => {
-    if (result.success) {
-      console.log(`Successfully subscribed to ${TOPICS.STATUS}`);
-    } else {
-      console.error(`Failed to subscribe to ${TOPICS.STATUS}:`, result.error);
-    }
-  })
-  .catch(error => {
-    console.error(`Error subscribing to ${TOPICS.STATUS}:`, error);
-    // Continue execution - don't let subscription failure crash the application
-  });
+  .then(result => console.log(`Subscription ${result.success ? 'succeeded' : 'failed'}`))
+  .catch(error => console.error('Subscription error:', error.message));
 
-// Create a safe wrapper for the MQTT message handler
-const safeOnMessage = (topic, callback) => {
+// Handle status updates safely
+MQTTClient.onMessage(TOPICS.STATUS, (topic, message) => {
   try {
-    MQTTClient.onMessage(topic, (receivedTopic, message) => {
-      try {
-        callback(receivedTopic, message);
-      } catch (callbackError) {
-        console.error(`Error in message handler for ${topic}:`, callbackError);
-      }
-    });
-  } catch (error) {
-    console.error(`Error setting up message handler for ${topic}:`, error);
-  }
-};
-
-// Handle status updates from ESP8266 with error handling
-safeOnMessage(TOPICS.STATUS, (topic, message) => {
-  try {
-    console.log(`Received relay status from ESP8266: ${message}`);
+    console.log(`Received relay status: ${message}`);
     
-    // Try to parse as JSON first
-    const status = JSON.parse(message);
-    
-    // Handle object with relay states
-    if (typeof status === 'object' && !Array.isArray(status)) {
-      Object.entries(status).forEach(([relayId, state]) => {
-        if (updateRelayState(relayId, state)) {
-          console.log(`ESP8266 reports: Relay ${relayId} is ${state}`);
-        }
-      });
-      return;
-    }
-  } catch (error) {
-    // Not JSON or other error, handle as text
+    // Try parsing as JSON
     try {
+      const status = JSON.parse(message);
+      if (typeof status === 'object' && !Array.isArray(status)) {
+        Object.entries(status).forEach(([relayId, state]) => {
+          if (updateRelayState(relayId, state)) {
+            console.log(`ESP reports: ${relayId} is ${state}`);
+          }
+        });
+        return;
+      }
+    } catch {
+      // Not JSON, handle as text
       const text = message.toString().trim();
       
-      // Check for relay ID pattern (r1, r2, etc.)
-      const relayMatch = text.match(/(r[1-4])/i);
+      // Check for relay ID pattern
+      const relayMatch = text.match(/(r[1-5]|v1)/i);
       if (relayMatch) {
         const relayId = relayMatch[1].toLowerCase();
         
-        // Determine state based on message content
+        // Determine state
         let state = "unknown";
         if (text === relayId) state = "ON";
         else if (text.includes(relayId + "_OFF")) state = "OFF";
@@ -345,24 +222,24 @@ safeOnMessage(TOPICS.STATUS, (topic, message) => {
         else if (text.includes("OFF")) state = "OFF";
         
         if (updateRelayState(relayId, state)) {
-          console.log(`ESP8266 reports: Relay ${relayId} is ${state}`);
+          console.log(`ESP reports: ${relayId} is ${state}`);
         }
       } 
-      // Handle simple ON/OFF messages
+      // Handle simple ON/OFF
       else if (text.toUpperCase() === 'ON' || text.toUpperCase() === 'OFF') {
         updateRelayState('r1', text.toUpperCase());
-        console.log(`ESP8266 reports: Relay r1 is ${text.toUpperCase()}`);
+        console.log(`ESP reports: r1 is ${text.toUpperCase()}`);
       }
-    } catch (parseError) {
-      console.error('Error processing message:', parseError);
     }
+  } catch (error) {
+    console.error('Error processing status message:', error.message);
   }
 });
 
 // ============ HTTP CONTROLLERS ============
 
 /**
- * Get status of all relays directly from ESP8266
+ * Get status of all relays
  */
 const getRelayStatus = async (req, res) => {
   try {
@@ -373,24 +250,15 @@ const getRelayStatus = async (req, res) => {
       });
     }
     
-    // Always force a fresh request to the ESP8266
-    const forceRefresh = req.query.refresh !== 'false';
-    
-    if (forceRefresh) {
-      console.log('Forcing refresh of relay states from ESP8266');
-    }
-    
-    // Get states directly from ESP8266
     const states = await requestRelayStatus('all');
     
-    // Return state object
     return res.json({
       states,
       source: 'ESP8266',
       timestamp: Date.now()
     });
   } catch (error) {
-    console.error('Error getting relay status:', error);
+    console.error('Error getting relay status:', error.message);
     return res.status(500).json({
       message: error.message,
       success: false
@@ -399,7 +267,7 @@ const getRelayStatus = async (req, res) => {
 };
 
 /**
- * Get status of a specific relay directly from ESP8266
+ * Get status of a specific relay
  */
 const getSpecificRelayStatus = async (req, res) => {
   try {
@@ -419,11 +287,9 @@ const getSpecificRelayStatus = async (req, res) => {
       });
     }
     
-    // Always request fresh status from ESP8266
     const state = await requestRelayStatus(relayId);
     const lastUpdate = relayStates.get(relayId)?.lastUpdate || 0;
     
-    // Return comprehensive relay information
     return res.json({
       relayId,
       name: relayConfig[relayId].name,
@@ -434,7 +300,7 @@ const getSpecificRelayStatus = async (req, res) => {
       source: 'ESP8266'
     });
   } catch (error) {
-    console.error(`Error getting relay status:`, error);
+    console.error(`Error getting relay status:`, error.message);
     return res.status(500).json({
       message: error.message,
       success: false
@@ -443,7 +309,7 @@ const getSpecificRelayStatus = async (req, res) => {
 };
 
 /**
- * Control a relay (ON or OFF) and get status from ESP8266
+ * Control a relay (ON or OFF)
  */
 async function controlRelayEndpoint(req, res, state) {
   try {
@@ -463,7 +329,6 @@ async function controlRelayEndpoint(req, res, state) {
       });
     }
     
-    // Send command and get verified state from ESP8266
     const result = await controlRelay(relayId, state);
     
     if (!result.success) {
@@ -475,9 +340,8 @@ async function controlRelayEndpoint(req, res, state) {
       });
     }
     
-    // Prepare response based on ESP8266 verification
     const response = {
-      message: `Command sent to ${result.name}: ${state}. ESP8266 reports: ${result.state}`,
+      message: `Command sent to ${result.name}: ${state}. ESP reports: ${result.state}`,
       relayId,
       name: result.name,
       id: result.id,
@@ -487,13 +351,12 @@ async function controlRelayEndpoint(req, res, state) {
       source: 'ESP8266'
     };
     
-    // Add warning information if needed
     if (result.warning) response.warning = result.warning;
     if (result.stateMatch === false) response.stateMatch = false;
     
     return res.json(response);
   } catch (error) {
-    console.error(`Error controlling relay:`, error);
+    console.error(`Error controlling relay:`, error.message);
     return res.status(503).json({
       message: error.message,
       success: false
@@ -501,31 +364,18 @@ async function controlRelayEndpoint(req, res, state) {
   }
 }
 
-/**
- * Turn a relay ON and get status from ESP8266
- */
 const sendRelayCommandOn = (req, res) => controlRelayEndpoint(req, res, 'ON');
-
-/**
- * Turn a relay OFF and get status from ESP8266
- */
 const sendRelayCommandOff = (req, res) => controlRelayEndpoint(req, res, 'OFF');
 
 /**
- * Get list of available relays with status from ESP8266
+ * Get list of available relays
  */
 const getRelayList = async (req, res) => {
   try {
-    let states = {};
-    
-    // Try to get fresh states, but don't fail if it doesn't work
-    try {
-      if (await checkConnection()) {
-        states = await requestRelayStatus('all');
-      }
-    } catch (stateError) {
-      console.error('Error refreshing relay states:', stateError);
-    }
+    // Try to get states but don't fail if it doesn't work
+    const states = await checkConnection() 
+      ? await requestRelayStatus('all').catch(() => ({}))
+      : {};
     
     const relays = Object.entries(relayConfig).map(([relayId, config]) => ({
       relayId,
@@ -539,34 +389,32 @@ const getRelayList = async (req, res) => {
     return res.json({
       relays,
       count: relays.length,
-      source: states.timestamp ? 'ESP8266' : 'cache'
+      source: Object.keys(states).length > 0 ? 'ESP8266' : 'cache'
     });
   } catch (error) {
-    console.error(`Error getting relay list:`, error);
+    console.error('Error getting relay list:', error.message);
     
-    // If we can't get states from ESP8266, still return the list
+    // Still return the list with unknown states
     const relays = Object.entries(relayConfig).map(([relayId, config]) => ({
       relayId,
       name: config.name,
       description: config.description,
       id: config.id,
-      state: 'unknown',
-      error: 'Could not get state from ESP8266'
+      state: 'unknown'
     }));
     
     return res.json({
       relays,
       count: relays.length,
-      warning: 'Could not refresh states from ESP8266'
+      warning: 'Could not get states from ESP8266'
     });
   }
 };
 
-// Add uncaught exception and promise rejection handlers for safety
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Promise Rejection:', reason);
-  // Don't crash the application
-});
+// Handle uncaught promise rejections
+process.on('unhandledRejection', (reason) => 
+  console.error('Unhandled Promise Rejection:', reason)
+);
 
 export default {
   sendRelayCommandOn,
@@ -575,4 +423,4 @@ export default {
   getSpecificRelayStatus,
   getRelayList,
   checkConnection
-}       
+};       
