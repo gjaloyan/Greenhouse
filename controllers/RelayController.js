@@ -47,14 +47,29 @@ function updateRelayState(relayId, state) {
 
 // ============ MQTT COMMUNICATION ============
 
+/**
+ * Checks and ensures MQTT connection is active
+ * 
+ * This function verifies the MQTT connection status and attempts to reconnect if needed.
+ * It follows these steps:
+ * 1. Check if already connected
+ * 2. Check greenhouse connection status
+ * 3. Attempt reconnection if disconnected
+ * 
+ * @returns {Promise<boolean>} True if connected, false otherwise
+ */
 async function checkConnection() {
-  if (MQTTClient.isConnected()) return true;
   
+  // Then check greenhouse connection
+  if (MQTTClient.checkGreenhouse()) return true;
+
   try {
+    // Attempt reconnection if the method exists
     if (typeof MQTTClient.reconnect === 'function') {
       const reconnected = await MQTTClient.reconnect();
       if (reconnected) {
         console.log('Reconnected to MQTT broker');
+        // Re-subscribe to status topic after reconnection
         await MQTTClient.subscribeToTopic(TOPICS.STATUS);
         return true;
       }
@@ -62,6 +77,7 @@ async function checkConnection() {
     console.log('MQTT disconnected and reconnection failed');
     return false;
   } catch (error) {
+    // Log any errors that occur during connection check
     console.error('Connection check error:', error.message);
     return false;
   }
@@ -98,7 +114,7 @@ async function requestRelayStatus(target = 'all') {
       if (await checkConnection()) {
         await publishToESP(TOPICS.STATUS_REQUEST, target);
         await new Promise(resolve => setTimeout(resolve, TIMEOUT.ESP_RESPONSE));
-      }
+        }
     } catch (error) {
       console.error('Status request failed:', error.message);
     }
@@ -417,8 +433,8 @@ process.on('unhandledRejection', (reason) =>
 );
 
 export default {
-  sendRelayCommandOn,
-  sendRelayCommandOff,
+    sendRelayCommandOn,
+    sendRelayCommandOff,
   getRelayStatus,
   getSpecificRelayStatus,
   getRelayList,

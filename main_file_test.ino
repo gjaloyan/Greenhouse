@@ -1,10 +1,13 @@
-
 #include <ModbusMaster.h>
 #include <WiFi.h>          // Changed from ESP8266WiFi.h
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 // #include <Hash.h>
 #include <Adafruit_Sensor.h>
+
+#include <Preferences.h>
+
+Preferences preferences;
 
 // ESP32 pin definitions
 #define RS485_TX_PIN   17   // UART2 TX
@@ -29,8 +32,8 @@ const char* mqtt_server = "34.71.239.197";
 const int mqtt_port = 1883;
 const char* mqtt_user = "gjaloyan";
 const char* mqtt_password = "26839269";
-const char* mqtt_client_id = "ESP8266_Greenhouse";
-const char* server_client_id = "ESP8266_SHT20_1";
+const char* mqtt_client_id = "ESP32_Greenhouse";
+const char* greenhouse_id = "Greenhouse1"; // Уникальный ID этой теплицы
 
 
 
@@ -44,10 +47,14 @@ const char* topic_ldr_read = "sensors/ldr/read";
 const char* topic_relay_command = "relay/command";
 const char* topic_relay_status = "relay/status";
 const char* topic_relay_status_get = "relay/status/get";
+const char* topic_greenhouse_status = "greenhouse/status";
+const char* topic_greenhouse_status_get = "greenhouse/status/get";
 
 //Ventilation Topics
-const char* vent_command = "ventilation";
+const char* topic_ventilation_command = "ventilation/command";
 const char* topic_ventilation_status = "ventilation/status";
+const char* ventilation_setpoints = "ventilation/setpoints";
+const char* ventilation_setpoints_get = "ventilation/setpoints/get";
 
 
 StaticJsonDocument<200> RelayState;
@@ -64,16 +71,26 @@ bool relayStatus[4] = {false, false, false, false};
 float temperature = 0.0;
 float humidity    = 0.0;
 
+// Ventilation System Variables
 const char* ventilationStatus = "closed";
 float ventilation_temperature_setpoint = 26.0;
-bool ventilation_control_auto_state = true;
+bool ventilation_control_auto_state = false;
+unsigned long ventilation_open_coefficient = 500;
+
+unsigned long ventilation_start_time = 0;
+unsigned long ventilation_open_duration = 0;
+int ventilation_percent_target = 0;
+bool ventilation_in_progress = false;
+int current_ventilation_percent = 0;
+int ventilation_wind_speed_setpoint = 0;
+int wind_speed_current = 0;
 
 
 void setup() {
   // Configure RS485 control pin
   pinMode(RS485_CONTROL_PIN, OUTPUT);
   digitalWrite(RS485_CONTROL_PIN, LOW); // Start in receive mode
-  
+
   // Start Serial for debugging
   Serial.begin(9600);
   Serial.println("\n\nInitializing system...");
@@ -93,8 +110,34 @@ void setup() {
   node.preTransmission(preTransmission);
   delay(20);
   node.postTransmission(postTransmission);
+
+    // Open preferences with namespace "greenhouse"
+  preferences.begin("greenhouse", false);
+  
+  // Restore saved values
+  ventilation_temperature_setpoint = preferences.getFloat("temp_setpoint", 26.0); // Default 26.0
+  current_ventilation_percent = preferences.getInt("vent_percent", 0); // Default 0%
+  ventilation_control_auto_state = preferences.getBool("auto_control", false); // Default false
+  ventilation_wind_speed_setpoint = preferences.getInt("wind_speed", 0); // Default 0%
+
+  // You could also load relay states
+  relayStatus[0] = preferences.getBool("relay1", false);
+  relayStatus[1] = preferences.getBool("relay2", false);
+  relayStatus[2] = preferences.getBool("relay3", false);
+  relayStatus[3] = preferences.getBool("relay4", false);
+
+    // Apply loaded states to hardware
+  for (int i = 0; i < 4; i++) {
+    if (relayStatus[i]) {
+      turnOnRelay(i+1);
+    } else {
+      turnOffRelay(i+1);
+    }
+  }
+
 }
 
+  
 
 void loop() {
 
@@ -103,6 +146,19 @@ void loop() {
   }
   mqttClient.loop();
 
+if (ventilation_in_progress && (millis() - ventilation_start_time >= ventilation_open_duration)) {
+  ventilation_control_stop();
+  ventilation_in_progress = false;
+  Serial.println("Ventilation movement complete. Now at " + String(current_ventilation_percent) + "%");
+}
+
+if (wind_speed_current > ventilation_wind_speed_setpoint){
+  ventilation_control_stop();
+  ventilation_in_progress = false;
+  Serial.println("Vindspeed is very high. Ventilation stopped");
+}
+
+
 
   // Publish sensor data periodically
   unsigned long now = millis();
@@ -110,6 +166,7 @@ void loop() {
     lastMsg = now;
     readSHT20Data();
     ventilation_control_auto();
+    // readWindSpeed();
   }
 }
 
@@ -142,8 +199,6 @@ void reconnectMQTT() {
     // Пытаемся подключиться с уникальным идентификатором клиента
     if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
       Serial.println("connected");
-      // После подключения можно публиковать сообщения или подписываться на темы
-      mqttClient.publish("greenhouse/status", "greenhouse online");
 
       // Subscribe to topics
       mqttClient.subscribe(topic_sht20_read);
@@ -151,9 +206,11 @@ void reconnectMQTT() {
       mqttClient.subscribe(topic_ldr_read);
       mqttClient.subscribe(topic_relay_command);
       mqttClient.subscribe(topic_relay_status_get);
-
-      // Publish initial status
-      publishAllRelayStatus();
+      mqttClient.subscribe(topic_ventilation_command);
+      mqttClient.subscribe(topic_ventilation_status); 
+      mqttClient.subscribe(topic_greenhouse_status_get);
+      mqttClient.subscribe(ventilation_setpoints);
+      mqttClient.subscribe(ventilation_setpoints_get);
 
     } else {
       Serial.print("failed, rc=");
@@ -162,6 +219,18 @@ void reconnectMQTT() {
       delay(5000);
     }
   }
+}
+
+void publishGreenhouseStatus(){
+  StaticJsonDocument<200> doc;
+  doc["status"] = "online";
+  doc["client_id"] = mqtt_client_id;
+  doc["greenhouse_id"] = greenhouse_id;
+  
+  char buffer[200];
+  serializeJson(doc, buffer);
+  
+  sendMQTTData(topic_greenhouse_status, buffer);
 }
 
 
@@ -176,38 +245,115 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   
   String topicStr = String(topic);
   String messageStr = String(message);
-  
+  const char* action = ""; 
+  int actionValue = 0; // Добавляем переменную для числовых значений действий
+  int actionValue2 = 0; // Добавляем переменную для числовых значений действий
+  float setpointTemperature = 0;
+  int setpointCoefficient = 0;
+  int setpointWindSpeed = 0;
+
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("]: ");
   Serial.println(messageStr);
 
+  // Проверяем, адресовано ли сообщение этой теплице
+  // Если сообщение содержит JSON, проверяем поле target_greenhouse
+  bool messageForThisGreenhouse = true; // По умолчанию обрабатываем
+  
+  if (messageStr.indexOf("{") >= 0) {
+    // Если сообщение содержит JSON структуру
+    StaticJsonDocument<400> doc;
+    DeserializationError error = deserializeJson(doc, messageStr);
 
-    // Handle sensor read requests
-  if (topicStr == topic_sht20_read && messageStr == "request") {
+    if (!error && doc.containsKey("target_greenhouse")) {
+      // Если сообщение содержит поле target_greenhouse
+      const char* targetId = doc["target_greenhouse"];
+      
+      // Проверяем, есть ли поле action
+      if (doc.containsKey("action")) {
+        // Сохраняем значение action в зависимости от его типа
+        if (doc["action"].is<int>()) {
+          // Если action - число (для вентиляции)
+          actionValue = doc["action"].as<int>();
+          action = ""; // Строковое значение пустое, так как action числовой
+        } else if (doc["action"].is<const char*>()) {
+          // Если action - строка (для других команд)
+          action = doc["action"].as<const char*>();
+        }
+      }
+
+
+      if (doc.containsKey("ventilation_setpoint_temperature")) {
+        setpointTemperature = doc["ventilation_setpoint_temperature"].as<float>();
+        setpointCoefficient = doc["ventilation_setpoint_coefficient"].as<int>();
+        setpointWindSpeed = doc["ventilation_setpoint_wind_speed"].as<int>();
+      }
+
+      messageForThisGreenhouse = (strcmp(targetId, greenhouse_id) == 0);
+      
+      if (!messageForThisGreenhouse) {
+        Serial.println("Message is for a different greenhouse. Ignoring.");
+        return; // Не обрабатываем сообщение
+      }
+    }
+    
+    // Проверка: если сообщение содержит наш собственный greenhouse_id и это сообщение о статусе вентиляции,
+    // то это наше собственное сообщение, которое мы отправили - игнорируем его
+    if (!error && doc.containsKey("greenhouse_id") && strcmp(doc["greenhouse_id"], greenhouse_id) == 0) {
+      if (topicStr == topic_ventilation_status) {
+        Serial.println("Ignoring our own ventilation status message");
+        return; // Пропускаем обработку нашего собственного сообщения
+      }
+    }
+  }
+  
+  String actionStr = String(action);
+ 
+  // Продолжаем обработку сообщения, если оно для этой теплицы
+  // Handle sensor read requests
+  if (topicStr == topic_sht20_read && actionStr == "request") {
     publishSHT20Data();
   } 
-  else if (topicStr == topic_bmp280_read && messageStr == "request") {
+  else if (topicStr == topic_bmp280_read && actionStr == "request") {
     // publishBMP280Data();
   }
-  else if (topicStr == topic_ldr_read && messageStr == "request") {
+  else if (topicStr == topic_ldr_read && actionStr == "request") {
     // publishLDRData();
   }
     // Handle relay commands
   else if (topicStr == topic_relay_command) {
-    handleRelayCommand(messageStr);
+    handleRelayCommand(actionStr);
+  }
+  else if (topicStr == topic_ventilation_command) {
+    ventilation_control_open_percent(actionValue);
+  }
+  else if (topicStr == topic_ventilation_status && actionStr == "get") {
+    publishVentilationStatus();
+  }
+  else if (topicStr == topic_greenhouse_status_get) {
+    publishGreenhouseStatus();
+  }
+  else if (topicStr == ventilation_setpoints) {
+    Serial.println(setpointTemperature);
+      Serial.println(setpointCoefficient);
+        Serial.println(setpointWindSpeed);
+    setVentilationSetpoints(setpointTemperature, setpointCoefficient, setpointWindSpeed);
+  }
+  else if (topicStr == ventilation_setpoints_get && actionStr == "get") {
+    publishVentilationSetpoints();
   }
   // Handle status requests
   else if (topicStr == topic_relay_status_get) {
-    if (messageStr == "all") {
+    if (actionStr == "all") {
       publishAllRelayStatus();
     } else {
       // Check if it's a specific relay request
-      if (messageStr == "r1") publishRelayStatus(1);
-      else if (messageStr == "r2") publishRelayStatus(2);
-      else if (messageStr == "r3") publishRelayStatus(3);
-      else if (messageStr == "r4") publishRelayStatus(4);
-      else if (messageStr == "v1") publishVentilationStatus();
+      if (actionStr == "r1") publishRelayStatus(1);
+      else if (actionStr == "r2") publishRelayStatus(2);
+      else if (actionStr == "r3") publishRelayStatus(3);
+      else if (actionStr == "r4") publishRelayStatus(4);
+      else if (actionStr == "v1") publishVentilationStatus();
     }
   }
 }
@@ -268,14 +414,6 @@ void publishSensorData() {
   // publishLDRData();
 }
 
-
-
-
-
-
-
-
-
 void sendMQTTData(const char* topic, const char* data) {
     if (!mqttClient.connected()) {
     reconnectMQTT();
@@ -299,6 +437,7 @@ void turnOnRelay(int relayNum) {
     int bytesWritten = relaySerial.write(command, sizeof(command));
     Serial.println("Relay turned on successfully");
     relayStatus[relayNum - 1] = true;
+    saveRelayState(relayNum, true);
   } else {
     Serial.println("Error writing to relay serial port");
     relayStatus[relayNum - 1] = false;
@@ -313,11 +452,20 @@ void turnOffRelay(int relayNum) {
     int bytesWritten = relaySerial.write(command, sizeof(command));
     Serial.println("Relay turned off successfully");
     relayStatus[relayNum - 1] = false;
+    saveRelayState(relayNum, false);
   } else {
     Serial.println("Error writing to relay serial port");
     relayStatus[relayNum - 1] = false;
   }
 }
+
+
+// Function to save relay state
+void saveRelayState(int relayNum, bool state) {
+  String key = "relay" + String(relayNum);
+  preferences.putBool(key.c_str(), state);
+}
+
 
 // Вызывается перед отправкой запроса (TX-режим)
 void preTransmission() {
@@ -328,6 +476,49 @@ void postTransmission() {
   digitalWrite(RS485_CONTROL_PIN, LOW);
 }
 
+void readWindSpeed(){
+  const int maxAttempts = 50;  // Maximum number of retry attempts
+  int attempt = 0;
+  bool success = false;
+  while (attempt < maxAttempts && !success) {
+    // Установить ID устройства (slave ID) для конкретного датчика
+    // node.setServerID(2);  // Поменяйте на ID вашего датчика (обычно 1-247)
+    // Чтение данных с конкретного регистра
+    uint8_t result = node.readInputRegisters(2, 1);  // Пример: адрес 2, 1 регистра
+    if (result == node.ku8MBSuccess) {
+      uint16_t rawWindSpeed = node.getResponseBuffer(0);
+
+      // // Для float значения (4 байта / 2 регистра)
+      // union {
+      //   uint16_t words[2];
+      //   float value;
+      // } data;
+
+      // data.words[0] = rawWindSpeed;
+      // data.words[1] = 0;
+      // float sensorValue = data.value;
+
+
+      wind_speed_current = rawWindSpeed / 10.0;
+
+      success = true;
+
+    } else {
+      Serial.print("Modbus wind speed read error. Code: 0x");
+      Serial.println(result, HEX);
+      attempt++;
+      // Increase delay to allow the sensor more time to respond
+      delay(500);  
+    }
+  }
+
+  if (!success) {
+    Serial.println("Failed to read wind speed sensor data after multiple attempts.");
+  }
+  // Read wind speed from wind speed sensor
+  // TODO: Implement wind speed reading
+  wind_speed_current = 0; // Placeholder value
+}
 
 
 void readSHT20Data() {
@@ -351,7 +542,7 @@ void readSHT20Data() {
       success = true;
 
     } else {
-      Serial.print("Modbus read error. Code: 0x");
+      Serial.print("Modbus temperature and humidity read error. Code: 0x");
       Serial.println(result, HEX);
       attempt++;
       // Increase delay to allow the sensor more time to respond
@@ -360,23 +551,23 @@ void readSHT20Data() {
   }
 
   if (!success) {
-    Serial.println("Failed to read sensor data after multiple attempts.");
+    Serial.println("Failed to read temperature and humidity sensor data after multiple attempts.");
   }
 }
 
 void publishSHT20Data(){
-      readSHT20Data();
-      StaticJsonDocument<200> doc;
-      doc["temperature"] = temperature;
-      doc["humidity"] = humidity;
-      doc["client_id"] = mqtt_client_id;
+  readSHT20Data();
+  StaticJsonDocument<200> doc;
+  doc["temperature"] = temperature;
+  doc["humidity"] = humidity;
+  doc["client_id"] = mqtt_client_id;
+  doc["greenhouse_id"] = greenhouse_id;
 
-      char jsonBuffer[200];
-      serializeJson(doc, jsonBuffer);
-      
-      sendMQTTData(topic_sht20, jsonBuffer);
-      Serial.println("Data Sent");
-
+  char jsonBuffer[200];
+  serializeJson(doc, jsonBuffer);
+  
+  sendMQTTData(topic_sht20, jsonBuffer);
+  Serial.println("Data Sent");
 }
 
 
@@ -387,6 +578,7 @@ void publishAllRelayStatus() {
   doc["r2"] = relayStatus[1] ? "ON" : "OFF";
   doc["r3"] = relayStatus[2] ? "ON" : "OFF";
   doc["r4"] = relayStatus[3] ? "ON" : "OFF";
+  doc["greenhouse_id"] = greenhouse_id;
   
   char buffer[200];
   serializeJson(doc, buffer);
@@ -411,6 +603,7 @@ void publishRelayStatus(int relayIndex) {
   
   StaticJsonDocument<100> doc;
   doc[relayId] = state;
+  doc["greenhouse_id"] = greenhouse_id;
   
   char buffer[100];
   serializeJson(doc, buffer);
@@ -425,36 +618,96 @@ void ventilation_control_open(){
   turnOnRelay(4);
   if(relayStatus[3] == true){
     ventilationStatus = "open";
+    current_ventilation_percent = 100;
   }else{
     ventilationStatus = "open_error";
   }
 }
 
 void ventilation_control_close(){
-  turnOffRelay(4);
-  if(relayStatus[3] == false){
+  turnOnRelay(3);
+  if(relayStatus[2] == true){
     ventilationStatus = "closed";
+    current_ventilation_percent = 0;
   }else{
     ventilationStatus = "closed_error";
   }
 }
 
-
-void ventilation_control(String command){
-  if(command == "on"){
-    ventilation_control_open();
+void ventilation_control_stop(){
+  turnOffRelay(3);
+  turnOffRelay(4);
+  if(relayStatus[2] == false && relayStatus[3] == false){
+    ventilationStatus = "stopped";
+    current_ventilation_percent = ventilation_percent_target;
+  }else{
+    ventilationStatus = "stopped_error";
   }
-  else if(command == "off"){
-    ventilation_control_close();
-  }
-  else if(command == "status"){
-    publishRelayStatus(4);
-    publishVentilationStatus();
-  }
+  preferences.putInt("vent_percent", current_ventilation_percent);
+  publishVentilationStatus();
 }
 
+
+void ventilation_control_open_percent(int target_percent) {
+  // Validate input range
+  if (target_percent < 0) target_percent = 0;
+  if (target_percent > 100) target_percent = 100;
+  
+  // Calculate the relative movement needed
+  int relative_change = target_percent - current_ventilation_percent;
+  
+  if (relative_change == 0) {
+    // No change needed
+    Serial.println("Ventilation already at " + String(current_ventilation_percent) + "%");
+    publishVentilationStatus();
+    return;
+  }
+  
+  // Calculate duration based on the absolute value of relative change
+  int ventilation_open_interval = abs(relative_change) * ventilation_open_coefficient;
+  
+  Serial.println("Current position: " + String(current_ventilation_percent) + 
+                 "%, Target: " + String(target_percent) + 
+                 "%, Relative change: " + String(relative_change) + "%");
+  
+  if (relative_change < 0) {
+      Serial.println("Ventilation closing from " + String(current_ventilation_percent) + 
+                    "% to " + String(target_percent) + "% (Moving " + 
+                    String(abs(relative_change)) + "%)");
+      // Partial close
+      ventilation_control_close(); // Start closing motor
+      // Set up variables for non-blocking operation
+      ventilation_start_time = millis();
+      ventilation_open_duration = ventilation_open_interval;
+      ventilation_percent_target = target_percent;
+      ventilation_in_progress = true;
+      } else {
+
+      Serial.println("Ventilation opening from " + String(current_ventilation_percent) + 
+                    "% to " + String(target_percent) + "% (Moving " + 
+                    String(abs(relative_change)) + "%)");
+      // Partial open
+      ventilation_control_open(); // Start opening motor
+      // Set up variables for non-blocking operation
+      ventilation_start_time = millis();
+      ventilation_open_duration = ventilation_open_interval;
+      ventilation_percent_target = target_percent;
+      ventilation_in_progress = true;
+    }
+}
+
+
+
 void publishVentilationStatus(){
-  sendMQTTData(topic_ventilation_status, ventilationStatus);
+  StaticJsonDocument<200> doc;
+  doc["status"] = ventilationStatus;
+  doc["percent"] = current_ventilation_percent;
+  doc["greenhouse_id"] = greenhouse_id;
+  
+  char buffer[200];
+  serializeJson(doc, buffer);
+  
+  sendMQTTData(topic_ventilation_status, buffer);
 }
 
 void ventilation_control_auto(){
@@ -482,6 +735,36 @@ void ventilation_control_auto(){
 } 
 
 
+// Function to save ventilation settings
+void saveVentilationSettings() {
+  preferences.putFloat("temp_setpoint", ventilation_temperature_setpoint);
+  preferences.putInt("vent_percent", current_ventilation_percent);
+  preferences.putBool("auto_control", ventilation_control_auto_state);
+  preferences.putInt("vent_coefficient", ventilation_open_coefficient);
+}
+
+void setVentilationSetpoints(float temperature, int coefficient, int windSpeed){
+  ventilation_temperature_setpoint = temperature;
+  ventilation_open_coefficient = coefficient;
+  ventilation_wind_speed_setpoint = windSpeed;
+  saveVentilationSettings();
+  publishVentilationSetpoints();
+}
+
+
+void publishVentilationSetpoints(){
+  StaticJsonDocument<200> doc;
+  doc["temperature"] = (float)ventilation_temperature_setpoint;
+  doc["coefficient"] = ventilation_open_coefficient;
+  doc["wind_speed"] = ventilation_wind_speed_setpoint;
+  doc["client_id"] = mqtt_client_id;
+  doc["greenhouse_id"] = greenhouse_id;
+  
+  char buffer[200];
+  serializeJson(doc, buffer);
+  
+  sendMQTTData(ventilation_setpoints_get, buffer);
+}
 
 
 

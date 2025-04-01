@@ -5,7 +5,7 @@ import cors from 'cors';
 
 import {registerValidation, loginValidation,} from './validations/validations.js';
 import {handleValidationErrors, checkAuth} from './utils/index.js';
-import {UserController, SensorsController, RelayController, VentilationController} from './controllers/index.js';
+import {UserController, SensorsController, RelayController, VentilationController, GreenhouseController } from './controllers/index.js';
 
 
 mdb
@@ -74,8 +74,12 @@ app.post('/relay/off', RelayController.sendRelayCommandOff)
 
 // Ventilation routes
 app.get('/ventilation/status', VentilationController.getVentilationStatus)
-app.post('/ventilation/on', VentilationController.turnOnVentilation)
-app.post('/ventilation/off', VentilationController.turnOffVentilation)
+app.post('/ventilation/command', VentilationController.setVentilation)
+app.get('/ventilation/setpoints/get', VentilationController.getVentilationSetpoints)
+app.post('/ventilation/setpoints', VentilationController.updateVentilationSetpoints)
+
+app.post('/greenhouse/status', GreenhouseController.getGreenhouseStatus)
+
 
 
 app.listen(5555, (err) => {
