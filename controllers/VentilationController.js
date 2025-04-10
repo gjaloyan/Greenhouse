@@ -12,12 +12,14 @@ const TOPICS = {
     VENTILATION_COMMAND: 'ventilation/command',
     VENTILATION_STATUS: 'ventilation/status',
     VENTILATION_SETPOINTS: 'ventilation/setpoints',
-    VENTILATION_SETPOINTS_GET: 'ventilation/setpoints/get'
+    VENTILATION_SETPOINTS_GET: 'ventilation/setpoints/get',
+    VENTILATION_COMMAND_MANUAL: 'ventilation/command/manual',
+    VENTILATION_COMMAND_AUTO: 'ventilation/command/auto'
 };
 
 // Timeouts in milliseconds
 const TIMEOUT = {
-    STATUS_WAIT: 90000  // 1 minute wait timeout
+    STATUS_WAIT: 120000  // 2 minutes wait timeout
 };
 
 // Helper function to get formatted date time
@@ -41,7 +43,7 @@ function getFormattedDateTime() {
 
 // State storage
 let lastVentilationState = { state: 'unknown', percent: 0, lastUpdate: getFormattedDateTime() };
-let lastVentilationSetpoints = { temperature: 26.0, coefficient: 500, lastUpdate: getFormattedDateTime() };
+let lastVentilationSetpoints = { temperature: 0, coefficient: 0, windSpeed: 0, emergencyOffTemperature: 0, lastUpdate: getFormattedDateTime() };
 let statusUpdatePromiseResolver = null;
 let lastStatusUpdate = getFormattedDateTime();
 
@@ -171,10 +173,11 @@ MQTTClient.onMessage(TOPICS.VENTILATION_SETPOINTS_GET, (topic, message) => {
                 temperature: data.temperature,
                 coefficient: data.coefficient,
                 windSpeed: data.wind_speed,
+                emergencyOffTemperature: data.emergency_off_temperature,
                 lastUpdate: getFormattedDateTime()
             };
             
-            console.log(`Received ventilation setpoints from ESP: temp=${lastVentilationSetpoints.temperature}, coef=${lastVentilationSetpoints.coefficient}, wind=${lastVentilationSetpoints.windSpeed}`);
+            console.log(`Received ventilation setpoints from ESP: temp=${lastVentilationSetpoints.temperature}, coef=${lastVentilationSetpoints.coefficient}, wind=${lastVentilationSetpoints.windSpeed}, emergencyOffTemperature=${lastVentilationSetpoints.emergencyOffTemperature}`);
         } catch (error) {
             // Not a valid JSON
             console.log(`Received non-JSON message in ventilation setpoints topic: ${messageStr}`);
@@ -229,8 +232,8 @@ async function getVentilationState() {
         const result = await MQTTClient.publishToTopic(TOPICS.VENTILATION_STATUS, "get");
         if (!result?.success) throw new Error(`Failed to publish command: ${result?.error || 'Unknown error'}`);
         
-        // Wait 500ms to give ESP32 time to respond
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Wait 1 second to give ESP32 time to respond
+        await new Promise(resolve => setTimeout(resolve, 1000));
         
     } catch (error) {
         console.error("Failed to request status update:", error);
@@ -243,7 +246,7 @@ async function getVentilationState() {
         state: lastVentilationState.state,
         percent: lastVentilationState.percent,
         lastUpdate: lastVentilationState.lastUpdate,
-        source: 'esp32'
+        source: 'Greenhouse'
     };
 }
 
@@ -321,7 +324,7 @@ async function setVentilationPercent(percent) {
             state: finalStatus.state,
             percent: finalStatus.percent,
             lastUpdate: finalStatus.lastUpdate,
-            source: 'esp32',
+            source: 'Greenhouse',
             confirmed: finalStatus.percent === percent,
             completed: true
         };
@@ -335,7 +338,7 @@ async function setVentilationPercent(percent) {
                 percent: lastVentilationState.percent,
                 targetPercent: percent,
                 lastUpdate: lastVentilationState.lastUpdate,
-                source: 'esp32',
+                source: 'Greenhouse',
                 inProgress: true,
                 warning: "Partial update received, movement may still be in progress"
             };
@@ -499,9 +502,33 @@ const updateVentilationSetpoints = async (req, res) => {
     }
 };
 
+// Set ventilation command
+const setVentilationAuto = async (req, res) => {
+    try {
+        if (!await checkConnection()) {
+            return res.status(503).json({ message: 'MQTT server unavailable', success: false });
+        }
+        if(req.body.action === "auto") {
+            await publishCommand(TOPICS.VENTILATION_COMMAND_AUTO, "auto");
+            const status = await getVentilationState();
+            return res.json({ message: 'Ventilation command sent for auto', ...status, success: true });
+        } else if(req.body.action === "manual") {
+            await publishCommand(TOPICS.VENTILATION_COMMAND_MANUAL, "manual");
+            const status = await getVentilationState();
+            return res.json({ message: 'Ventilation command sent for manual', ...status, success: true }); 
+        } else {
+            return res.json({ message: 'Invalid action', success: false });
+        }
+    } catch (error) {
+        console.error('Error setting ventilation command:', error);
+        return res.status(503).json({ message: error.message, success: false });
+    }
+};
+
 export default {
     getVentilationStatus,
     setVentilation,
     getVentilationSetpoints,
-    updateVentilationSetpoints
+    updateVentilationSetpoints,
+    setVentilationAuto
 };

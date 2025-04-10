@@ -5,7 +5,7 @@ import cors from 'cors';
 
 import {registerValidation, loginValidation,} from './validations/validations.js';
 import {handleValidationErrors, checkAuth} from './utils/index.js';
-import {UserController, SensorsController, RelayController, VentilationController, GreenhouseController } from './controllers/index.js';
+import {UserController, SensorsController, RelayController, VentilationController, GreenhouseController, CoolingController } from './controllers/index.js';
 
 
 mdb
@@ -77,8 +77,18 @@ app.get('/ventilation/status', VentilationController.getVentilationStatus)
 app.post('/ventilation/command', VentilationController.setVentilation)
 app.get('/ventilation/setpoints/get', VentilationController.getVentilationSetpoints)
 app.post('/ventilation/setpoints', VentilationController.updateVentilationSetpoints)
+app.post('/ventilation/command/auto', VentilationController.setVentilationAuto)
 
 app.post('/greenhouse/status', GreenhouseController.getGreenhouseStatus)
+
+// // Cooling routes
+// app.post('/cooling/status', CoolingController.getCoolingState)
+// app.post('/cooling/setpoints', CoolingController.updateCoolingSetpoints)
+// // app.post('/cooling/command', CoolingController.)
+// app.post('/cooling/command/auto', CoolingController.setCoolingAuto)
+// app.post('/cooling/command/ventilator/start', CoolingController.setCoolingVentilatorStart)
+// app.post('/cooling/command/ventilator/stop', CoolingController.setCoolingVentilatorStop)
+// app.get('/cooling/setpoints/get', CoolingController.getCoolingSetpoints)
 
 
 

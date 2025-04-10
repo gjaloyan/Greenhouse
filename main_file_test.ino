@@ -4,8 +4,8 @@
 #include <ArduinoJson.h>
 // #include <Hash.h>
 #include <Adafruit_Sensor.h>
-
 #include <Preferences.h>
+#include <esp_wifi.h>      // For esp_wifi_set_ps function
 
 Preferences preferences;
 
@@ -55,6 +55,19 @@ const char* topic_ventilation_command = "ventilation/command";
 const char* topic_ventilation_status = "ventilation/status";
 const char* ventilation_setpoints = "ventilation/setpoints";
 const char* ventilation_setpoints_get = "ventilation/setpoints/get";
+// const char* ventilation_command_manual = "ventilation/command/manual";
+// const char* ventilation_command_auto = "ventilation/command/auto";
+
+//Cooling Topics 
+const char* topic_cooling_command = "cooling/command";
+const char* topic_cooling_status = "cooling/status";
+const char* topic_cooling_setpoints = "cooling/setpoints";
+const char* topic_cooling_setpoints_get = "cooling/setpoints/get";
+const char* topic_cooling_command_ventilator_start = "cooling/command/ventilator/start";
+const char* topic_cooling_command_ventilator_stop = "cooling/command/ventilator/stop";
+// const char* topic_cooling_command_manual = "cooling/command/manual";
+// const char* topic_cooling_command_auto = "cooling/command/auto";
+
 
 
 StaticJsonDocument<200> RelayState;
@@ -84,7 +97,16 @@ bool ventilation_in_progress = false;
 int current_ventilation_percent = 0;
 int ventilation_wind_speed_setpoint = 0;
 int wind_speed_current = 0;
+float ventilation_emergency_off_temperature = 0;
 
+//Cooling System Variables
+float cooling_target_temperature = 0;
+float cooling_emergency_off_temperature = 0;
+bool cooling_control_auto_state = false;
+bool cooling_system_active = false;
+bool cooling_water_pump_status = false;
+bool cooling_ventilators_status[4] = {false, false, false, false};
+// int cooling_ventilators_intensity_setpoint = 0;
 
 void setup() {
   // Configure RS485 control pin
@@ -115,16 +137,29 @@ void setup() {
   preferences.begin("greenhouse", false);
   
   // Restore saved values
-  ventilation_temperature_setpoint = preferences.getFloat("temp_setpoint", 26.0); // Default 26.0
+  // Ventilation
+  ventilation_temperature_setpoint = preferences.getFloat("temp_setpoint", 20.0); // Default 26.0
   current_ventilation_percent = preferences.getInt("vent_percent", 0); // Default 0%
   ventilation_control_auto_state = preferences.getBool("auto_control", false); // Default false
   ventilation_wind_speed_setpoint = preferences.getInt("wind_speed", 0); // Default 0%
-
+  ventilation_emergency_off_temperature = preferences.getFloat("ventilation_emergency_off_temperature", 0); // Default 0%
+  // Cooling
+  cooling_target_temperature = preferences.getFloat("cooling_target_temperature", 0); // Default 0%
+  cooling_emergency_off_temperature = preferences.getFloat("cooling_emergency_off_temperature", 0); // Default 0%
+  cooling_control_auto_state = preferences.getBool("cooling_control_auto_state", false); // Default false
+  cooling_system_active = preferences.getBool("cooling_system_active", false); // Default false
+  
   // You could also load relay states
   relayStatus[0] = preferences.getBool("relay1", false);
   relayStatus[1] = preferences.getBool("relay2", false);
   relayStatus[2] = preferences.getBool("relay3", false);
   relayStatus[3] = preferences.getBool("relay4", false);
+
+  // Ventilators
+  cooling_ventilators_status[0] = preferences.getBool("v1", false);
+  cooling_ventilators_status[1] = preferences.getBool("v2", false);
+  cooling_ventilators_status[2] = preferences.getBool("v3", false);
+  cooling_ventilators_status[3] = preferences.getBool("v4", false);
 
     // Apply loaded states to hardware
   for (int i = 0; i < 4; i++) {
@@ -132,6 +167,14 @@ void setup() {
       turnOnRelay(i+1);
     } else {
       turnOffRelay(i+1);
+    }
+  }
+
+  for (int i = 0; i < 4; i++) {
+    if (cooling_ventilators_status[i]) {
+      startVentilator(i+1);
+    } else {
+      stopVentilator(i+1);
     }
   }
 
@@ -177,17 +220,32 @@ void setup_wifi() {
   Serial.print("Connecting to ");
   Serial.println(ssid);
 
+  // Set WiFi to station mode 
+  WiFi.mode(WIFI_STA);
+  
+  // Disable WiFi power saving mode
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  
+  // Begin connection
   WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  // Wait for connection with timeout
+  int timeout_counter = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout_counter < 50) {
     delay(500);
     Serial.print(".");
+    timeout_counter++;
   }
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("");
+    Serial.println("WiFi connection FAILED - continuing without WiFi");
+  }
 }
 
 
@@ -252,6 +310,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   int setpointCoefficient = 0;
   int setpointWindSpeed = 0;
 
+  float coolingSetpointTemperature = 0;
+  float coolingEmergencyOffTemperature = 0;
+  bool coolingControlAutoState = false;
+  
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("]: ");
@@ -288,6 +350,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         setpointTemperature = doc["ventilation_setpoint_temperature"].as<float>();
         setpointCoefficient = doc["ventilation_setpoint_coefficient"].as<int>();
         setpointWindSpeed = doc["ventilation_setpoint_wind_speed"].as<int>();
+        ventilation_emergency_off_temperature = doc["ventilation_emergency_off_temperature"].as<float>();
+      }
+      if (doc.containsKey("cooling_setpoint_temperature")) {
+        coolingSetpointTemperature = doc["cooling_setpoint_temperature"].as<float>();
+        coolingEmergencyOffTemperature = doc["cooling_emergency_off_temperature"].as<float>();
+        coolingControlAutoState = doc["cooling_control_auto_state"].as<bool>();
       }
 
       messageForThisGreenhouse = (strcmp(targetId, greenhouse_id) == 0);
@@ -325,8 +393,22 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   else if (topicStr == topic_relay_command) {
     handleRelayCommand(actionStr);
   }
+
+  // Ventilation
   else if (topicStr == topic_ventilation_command) {
     ventilation_control_open_percent(actionValue);
+    saveVentilationSettings();
+  }
+  else if (topicStr == topic_ventilation_command && actionStr == "auto") {
+    ventilation_control_auto_state = true;
+    ventilation_control_open_percent(0);
+    ventilation_control_auto();
+    saveVentilationSettings();
+  }
+  else if (topicStr == topic_ventilation_command && actionStr == "manual") {
+    ventilation_control_auto_state = false;
+    ventilation_control_open_percent(0);
+    saveVentilationSettings();
   }
   else if (topicStr == topic_ventilation_status && actionStr == "get") {
     publishVentilationStatus();
@@ -335,14 +417,42 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     publishGreenhouseStatus();
   }
   else if (topicStr == ventilation_setpoints) {
-    Serial.println(setpointTemperature);
-      Serial.println(setpointCoefficient);
-        Serial.println(setpointWindSpeed);
-    setVentilationSetpoints(setpointTemperature, setpointCoefficient, setpointWindSpeed);
+    setVentilationSetpoints(setpointTemperature, setpointCoefficient, setpointWindSpeed, ventilation_emergency_off_temperature);
   }
   else if (topicStr == ventilation_setpoints_get && actionStr == "get") {
     publishVentilationSetpoints();
   }
+
+  // Cooling
+  else if (topicStr == topic_cooling_setpoints_get && actionStr == "get") {
+    publishCoolingSetpoints();
+  }
+  else if (topicStr == topic_cooling_setpoints) {
+    setCoolingSetpoints(coolingSetpointTemperature, coolingEmergencyOffTemperature, coolingControlAutoState);
+  }
+  else if (topicStr == topic_cooling_status && actionStr == "get") {
+    publishCoolingStatus();
+  }
+  else if (topicStr == topic_cooling_command) {
+    cooling_system_start(actionValue);
+  }
+  else if (topicStr == topic_cooling_command_ventilator_start) {
+    startVentilator(actionValue);
+  }
+  else if (topicStr == topic_cooling_command_ventilator_stop) {
+    stopVentilator(actionValue);
+  }
+  else if (topicStr == topic_cooling_command && actionStr == "manual") {
+    cooling_control_auto_state = false;
+    cooling_system_stop();
+    saveCoolingSettings();
+  }
+  else if (topicStr == topic_cooling_command && actionStr == "auto") {
+    cooling_control_auto_state = true;
+    cooling_control_auto();
+    saveCoolingSettings();
+  }
+
   // Handle status requests
   else if (topicStr == topic_relay_status_get) {
     if (actionStr == "all") {
@@ -353,7 +463,6 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       else if (actionStr == "r2") publishRelayStatus(2);
       else if (actionStr == "r3") publishRelayStatus(3);
       else if (actionStr == "r4") publishRelayStatus(4);
-      else if (actionStr == "v1") publishVentilationStatus();
     }
   }
 }
@@ -435,7 +544,7 @@ void turnOnRelay(int relayNum) {
   delay(1000);
   if (bytesWritten == sizeof(command)) {
     int bytesWritten = relaySerial.write(command, sizeof(command));
-    Serial.println("Relay turned on successfully");
+    Serial.println("Relay " + String(relayNum) + " turned on successfully");
     relayStatus[relayNum - 1] = true;
     saveRelayState(relayNum, true);
   } else {
@@ -450,7 +559,7 @@ void turnOffRelay(int relayNum) {
   delay(1000);
   if (bytesWritten == sizeof(command)) {
     int bytesWritten = relaySerial.write(command, sizeof(command));
-    Serial.println("Relay turned off successfully");
+    Serial.println("Relay " + String(relayNum) + " turned Off successfully");
     relayStatus[relayNum - 1] = false;
     saveRelayState(relayNum, false);
   } else {
@@ -645,10 +754,15 @@ void ventilation_control_stop(){
   }
   preferences.putInt("vent_percent", current_ventilation_percent);
   publishVentilationStatus();
+  saveVentilationSettings();
 }
 
 
 void ventilation_control_open_percent(int target_percent) {
+  if(cooling_system_active == true){
+    Serial.println("Cooling system is active, turning off cooling system");
+    cooling_system_stop();
+  }
   // Validate input range
   if (target_percent < 0) target_percent = 0;
   if (target_percent > 100) target_percent = 100;
@@ -702,6 +816,7 @@ void publishVentilationStatus(){
   StaticJsonDocument<200> doc;
   doc["status"] = ventilationStatus;
   doc["percent"] = current_ventilation_percent;
+  doc["auto_control"] = ventilation_control_auto_state;
   doc["greenhouse_id"] = greenhouse_id;
   
   char buffer[200];
@@ -710,29 +825,45 @@ void publishVentilationStatus(){
   sendMQTTData(topic_ventilation_status, buffer);
 }
 
+// void ventilation_control_auto(){
+//   if(ventilation_control_auto_state){
+//       if(temperature > ventilation_temperature_setpoint){
+//         if(ventilationStatus == "closed"){
+//           Serial.println("Temp is Hight Turning Opening ventilation");
+//           ventilation_control_open_percent(25);
+//       }else {
+//         Serial.println("Temp is Hight but Ventilation turned on Du nothing");
+//        }
+//     }else if(temperature < ventilation_temperature_setpoint){
+//       if(ventilationStatus == "open"){
+//         Serial.println("Temp is Low Turning closing ventilation");
+//         Serial.println(temperature);
+//         Serial.println(ventilation_temperature_setpoint);
+//         ventilation_control_close();
+//       }else {
+//         Serial.println("Temp is low but Ventilation turned off Du nothing");
+//        }
+//     }
+//   }
+// } 
+
 void ventilation_control_auto(){
   if(ventilation_control_auto_state){
-      if(temperature > ventilation_temperature_setpoint){
-        if(ventilationStatus == "closed"){
-          Serial.println("Temp is Hight Turning Opening ventilation");
-          Serial.println(temperature);
-          Serial.println(ventilation_temperature_setpoint);
-          ventilation_control_open();
-      }else {
-        Serial.println("Temp is Hight but Ventilation turned on Du nothing");
-       }
+    if(temperature > ventilation_temperature_setpoint && ventilationStatus == "closed" || ventilationStatus == "stopped"){
+      ventilation_control_open_percent(25);
+    }else if(temperature > ventilation_temperature_setpoint + 2){
+      ventilation_control_open_percent(50);
+    }else if(temperature > ventilation_temperature_setpoint + 4){
+      ventilation_control_open_percent(75);
+    }else if(temperature > ventilation_temperature_setpoint + 6){
+      ventilation_control_open_percent(100);
     }else if(temperature < ventilation_temperature_setpoint){
-      if(ventilationStatus == "open"){
-        Serial.println("Temp is Low Turning closing ventilation");
-        Serial.println(temperature);
-        Serial.println(ventilation_temperature_setpoint);
-        ventilation_control_close();
-      }else {
-        Serial.println("Temp is low but Ventilation turned off Du nothing");
-       }
+      ventilation_control_open_percent(0);
+    }else if(temperature < ventilation_emergency_off_temperature){
+      ventilation_control_open_percent(0);
     }
-  }
-} 
+  } 
+}
 
 
 // Function to save ventilation settings
@@ -741,12 +872,14 @@ void saveVentilationSettings() {
   preferences.putInt("vent_percent", current_ventilation_percent);
   preferences.putBool("auto_control", ventilation_control_auto_state);
   preferences.putInt("vent_coefficient", ventilation_open_coefficient);
+  preferences.putFloat("ventilation_emergency_off_temperature", ventilation_emergency_off_temperature);
 }
 
-void setVentilationSetpoints(float temperature, int coefficient, int windSpeed){
+void setVentilationSetpoints(float temperature, int coefficient, int windSpeed, float emergency_off_temperature ){
   ventilation_temperature_setpoint = temperature;
   ventilation_open_coefficient = coefficient;
   ventilation_wind_speed_setpoint = windSpeed;
+  ventilation_emergency_off_temperature = emergency_off_temperature;
   saveVentilationSettings();
   publishVentilationSetpoints();
 }
@@ -757,7 +890,7 @@ void publishVentilationSetpoints(){
   doc["temperature"] = (float)ventilation_temperature_setpoint;
   doc["coefficient"] = ventilation_open_coefficient;
   doc["wind_speed"] = ventilation_wind_speed_setpoint;
-  doc["client_id"] = mqtt_client_id;
+  doc["emergency_off_temperature"] = ventilation_emergency_off_temperature;
   doc["greenhouse_id"] = greenhouse_id;
   
   char buffer[200];
@@ -767,6 +900,236 @@ void publishVentilationSetpoints(){
 }
 
 
+//Cooling System
 
 
+void startVentilator(int ventilatorIndex){
+  if(ventilatorIndex < 0 || ventilatorIndex > 4) return;
+  turnOnRelay(ventilatorIndex);
+  if(relayStatus[ventilatorIndex-1]){
+    cooling_ventilators_status[ventilatorIndex-1] = true;
+    String key = "v" + String(ventilatorIndex);
+    preferences.putBool(key.c_str(), true);
+    Serial.println("Ventilator " + String(ventilatorIndex) + " turned on successfully");
+    publishCoolingStatus();
+  }else{
+    Serial.println("Ventilator " + String(ventilatorIndex) + " turn on error");
+  }
+}
 
+void stopVentilator(int ventilatorIndex){
+  if(ventilatorIndex < 0 || ventilatorIndex > 4) return;
+  turnOffRelay(ventilatorIndex);
+  if(!relayStatus[ventilatorIndex-1]){
+    cooling_ventilators_status[ventilatorIndex-1] = false;
+    String key = "v" + String(ventilatorIndex);
+    preferences.putBool(key.c_str(), false);
+    Serial.println("Ventilator " + String(ventilatorIndex) + " turned off successfully");
+    publishCoolingStatus();
+  }else{
+    Serial.println("Ventilator " + String(ventilatorIndex) + " turn off error");
+  }
+}
+
+void publishCoolingSetpoints(){
+  StaticJsonDocument<200> doc;
+  doc["target_temperature"] = cooling_target_temperature;
+  doc["emergency_off_temperature"] = cooling_emergency_off_temperature;
+  doc["control_auto_state"] = cooling_control_auto_state;
+  doc["client_id"] = mqtt_client_id;
+  doc["greenhouse_id"] = greenhouse_id;
+  
+  char buffer[200];
+  serializeJson(doc, buffer);
+  
+  sendMQTTData(topic_cooling_setpoints, buffer);
+}
+
+void publishCoolingStatus(){
+  StaticJsonDocument<200> doc;
+  doc["status"] = cooling_system_active;
+  for(int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++){
+    doc["v" + String(i+1)] = cooling_ventilators_status[i];
+  }
+  doc["water_pump"] = cooling_water_pump_status;
+  doc["cooling_control_auto_state"] = cooling_control_auto_state;
+  doc["client_id"] = mqtt_client_id;
+  doc["greenhouse_id"] = greenhouse_id;
+  
+  char buffer[200];
+  serializeJson(doc, buffer);
+  
+  sendMQTTData(topic_cooling_status, buffer);
+}
+
+
+void saveCoolingSettings() {
+  preferences.putFloat("cooling_target_temperature", cooling_target_temperature);
+  preferences.putFloat("cooling_emergency_off_temperature", cooling_emergency_off_temperature);
+  preferences.putBool("cooling_control_auto_state", cooling_control_auto_state);
+  preferences.putBool("cooling_system_active", cooling_system_active);
+  for(int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++){
+    String key = "v" + String(i+1);
+    preferences.putBool(key.c_str(), cooling_ventilators_status[i]);
+  }
+  preferences.putBool("cooling_water_pump_status", cooling_water_pump_status);
+}
+
+void setCoolingSetpoints(float target_temperature, float emergency_off_temperature, bool control_auto_state){
+  cooling_target_temperature = target_temperature;
+  cooling_emergency_off_temperature = emergency_off_temperature;
+  cooling_control_auto_state = control_auto_state;
+  saveCoolingSettings();
+  publishCoolingSetpoints();
+}
+
+
+void cooling_control_auto(){
+  if(cooling_control_auto_state){
+    if(temperature > cooling_target_temperature && cooling_system_active == false){
+      cooling_system_active = true;
+      cooling_system_start(25);
+    }else if(temperature > cooling_target_temperature + 2){
+      cooling_system_start(50);
+    }else if(temperature > cooling_target_temperature + 4){
+      cooling_system_start(75);
+    }else if(temperature > cooling_target_temperature + 6){
+      cooling_system_start(100);
+    }else if(temperature < cooling_target_temperature){
+      cooling_system_stop();
+    }else if(temperature < cooling_emergency_off_temperature){
+      cooling_system_active = false;
+      cooling_system_stop();
+    }
+  } 
+}
+
+// Start Cooling System
+
+// Function to start cooling system, waiting for ventilation to fully close
+void cooling_system_start(int percent) {
+  // Check if ventilation is currently open
+  if (current_ventilation_percent > 0 || ventilation_in_progress) {
+    Serial.println("Waiting for ventilation to close before starting cooling system");
+    // Close ventilation first
+    ventilation_control_open_percent(0);
+     
+    // Wait until ventilation is fully closed
+    unsigned long startWaitTime = millis();
+    const unsigned long maxWaitTime = 60000; // Maximum wait time: 60 seconds
+    
+    // Wait until both conditions are met:
+    // 1. current_ventilation_percent is 0
+    // 2. ventilation_in_progress is false (movement has stopped)
+    while (current_ventilation_percent > 0 || ventilation_in_progress) {
+      // Check for timeout
+      if (millis() - startWaitTime > maxWaitTime) {
+        Serial.println("Timeout waiting for ventilation to close!");
+        break;
+      }
+      
+      // Process any pending MQTT messages while waiting
+      mqttClient.loop();
+      delay(100);
+      
+      // Print status every 2 seconds
+      if (millis() - startWaitTime % 2000 < 100) {
+        Serial.print("Waiting for ventilation: ");
+        Serial.print(current_ventilation_percent);
+        Serial.print("%, in_progress: ");
+        Serial.println(ventilation_in_progress ? "true" : "false");
+      }
+    }
+    
+    Serial.println("Ventilation closed successfully!");
+  }
+  
+  // Now start cooling system with requested percentage
+  Serial.print("Starting cooling system at ");
+  Serial.print(percent);
+  Serial.println("%");
+  
+  // Normalize percent value
+  percent = constrain(percent, 0, 100);
+  
+  // Turn on cooling fans based on percentage
+  if (percent >= 25) {
+    startVentilator(1); // First cooling ventilator
+    cooling_system_active = true;
+    cooling_ventilators_status[0] = true;
+  }
+  
+  if (percent >= 50) {
+    startVentilator(1);
+    startVentilator(2); // Second cooling ventilator
+    cooling_ventilators_status[1] = true;
+    cooling_system_active = true;
+  }
+  
+  if (percent >= 75) {
+    startVentilator(1);
+    startVentilator(2);
+    startVentilator(3); // Third cooling ventilator
+    cooling_ventilators_status[2] = true;
+    cooling_system_active = true;
+  }
+  
+  if (percent == 100) {
+    startVentilator(1);
+    startVentilator(2);
+    startVentilator(3);
+    startVentilator(4); // Fourth cooling ventilator
+    cooling_ventilators_status[3] = true;
+    cooling_system_active = true;
+  }
+  
+  // Update cooling status
+  saveCoolingSettings();
+  publishCoolingStatus();
+}
+
+void cooling_system_start_water_pump(){
+  turnOnRelay(2);
+  if(relayStatus[1]){
+    cooling_water_pump_status = true;
+  }
+  preferences.putBool("cooling_water_pump_status", cooling_water_pump_status);
+  publishCoolingStatus();
+}
+
+
+// Stop Cooling System
+
+void cooling_system_stop(){
+  if(cooling_system_active == true){
+    cooling_system_stop_ventilators();
+    cooling_system_stop_water_pump();
+    cooling_system_active = false;
+    saveCoolingSettings();
+    publishCoolingStatus();
+  }
+}
+
+void cooling_system_stop_ventilators(){
+  for(int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++){
+    stopVentilator(i+1);
+    delay(100);
+    if(relayStatus[i]){
+      cooling_ventilators_status[i] = true;
+    }else{
+      cooling_ventilators_status[i] = false;
+    }
+  }
+  cooling_system_active = false;
+  saveCoolingSettings();
+  publishCoolingStatus();
+}
+
+
+void cooling_system_stop_water_pump(){
+  turnOffRelay(2);
+  if(relayStatus[1]){
+    cooling_water_pump_status = false;
+  }
+  preferences.putBool("cooling_water_pump_status", cooling_water_pump_status);
+}

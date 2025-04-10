@@ -8,7 +8,6 @@ const relayConfig = {
   'r2': { name: 'Relay 2', description: 'Relay 2', id: 2 },
   'r3': { name: 'Relay 3', description: 'Relay 3', id: 3 },
   'r4': { name: 'Relay 4', description: 'Relay 4', id: 4 },
-  'v1': { name: 'Ventilation', description: 'Ventilation Main', id: 5 }
 };
 
 // MQTT Topics
@@ -329,7 +328,7 @@ const getSpecificRelayStatus = async (req, res) => {
  */
 async function controlRelayEndpoint(req, res, state) {
   try {
-    const relayId = req.params.relayId || 'r1';
+    const relayId = req.params.relayId;
     
     if (!relayConfig[relayId]) {
       return res.status(404).json({
