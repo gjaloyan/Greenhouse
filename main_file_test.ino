@@ -1,26 +1,27 @@
 #include <ModbusMaster.h>
-#include <WiFi.h>          // Changed from ESP8266WiFi.h
+#include <WiFi.h>       
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 // #include <Hash.h>
 #include <Adafruit_Sensor.h>
 #include <Preferences.h>
 #include <esp_wifi.h>      // For esp_wifi_set_ps function
+#include "driver/uart.h"
 
 Preferences preferences;
 
-// ESP32 pin definitions
-#define RS485_TX_PIN   17   // UART2 TX
-#define RS485_RX_PIN   16   // UART2 RX
-#define RS485_CONTROL_PIN 4 // DE/RE pin for RS485
+// Для модуля MAX485, подключенного к датчикам
+#define SENSOR_RS485_RX_PIN   16   // UART2 RX 
+#define SENSOR_RS485_TX_PIN   17   // UART2 TX
+#define SENSOR_RS485_CONTROL_PIN 4 // DE/RE pin
 
-// Use Hardware Serial for relay control
-#define RELAY_TX_PIN   14   // UART1 TX
-#define RELAY_RX_PIN   15   // UART1 RX
+// Для модуля MAX485, подключенного к реле
+#define RELAY_RS485_RX_PIN   26    // Измените с GPIO3 на GPIO26
+#define RELAY_RS485_TX_PIN   25    // Измените с GPIO1 на GPIO25
 
-// Define HardwareSerial for relay control (ESP32 has multiple hardware serial ports)
-HardwareSerial relaySerial(1); // Use UART1 for relay control
-HardwareSerial rs485Serial(2); // Use UART2 for RS485/Modbus
+// Определение последовательных портов
+HardwareSerial rs485RelaySerial(1); // UART1 для управления реле через MAX485
+HardwareSerial rs485SensorSerial(2); // 
 
 
 // Настройки WiFi
@@ -75,8 +76,8 @@ StaticJsonDocument<200> RelayState;
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
-ModbusMaster node;
-
+ModbusMaster nodeSensor; // Для датчиков
+ModbusMaster nodeRelay;  // Для реле
 // Variables
 unsigned long lastMsg = 0;
 unsigned long sensorPollInterval = 10000; // 3 seconds
@@ -106,35 +107,50 @@ bool cooling_control_auto_state = false;
 bool cooling_system_active = false;
 bool cooling_water_pump_status = false;
 bool cooling_ventilators_status[4] = {false, false, false, false};
+
 // int cooling_ventilators_intensity_setpoint = 0;
 
 void setup() {
-  // Configure RS485 control pin
-  pinMode(RS485_CONTROL_PIN, OUTPUT);
-  digitalWrite(RS485_CONTROL_PIN, LOW); // Start in receive mode
-
   // Start Serial for debugging
   Serial.begin(9600);
   Serial.println("\n\nInitializing system...");
+
+
+
+
+
   
-  // Initialize relay serial
-  relaySerial.begin(115200, SERIAL_8N1, RELAY_RX_PIN, RELAY_TX_PIN);
+  // Early WiFi initialization
+  WiFi.mode(WIFI_STA);
+
+   // Настройка пинов управления RS485
+  pinMode(SENSOR_RS485_CONTROL_PIN, OUTPUT);
+  digitalWrite(SENSOR_RS485_CONTROL_PIN, LOW); // Режим приема
+
   
-  // Initialize RS485 serial
-  rs485Serial.begin(9600, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  // Инициализация UART для датчиков
+  rs485SensorSerial.begin(9600, SERIAL_8N1, SENSOR_RS485_RX_PIN, SENSOR_RS485_TX_PIN);
   
+  // Инициализация UART для реле
+  rs485RelaySerial.begin(9600, SERIAL_8N1, RELAY_RS485_RX_PIN, RELAY_RS485_TX_PIN);
+  
+    // Только один вызов WiFi инициализации
+  // WiFi.mode(WIFI_STA);
+  delay(100);
   setup_wifi();
+  
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqtt_callback);
   
-  // Initialize Modbus with RS485 serial
-  node.begin(1, rs485Serial);
-  node.preTransmission(preTransmission);
-  delay(20);
-  node.postTransmission(postTransmission);
+  // Инициализация ModbusMaster для датчиков
+  nodeSensor.begin(1, rs485SensorSerial);
+  nodeSensor.preTransmission(preSensorTransmission);
+  nodeSensor.postTransmission(postSensorTransmission);
+  
 
-    // Open preferences with namespace "greenhouse"
+  // Open preferences with namespace "greenhouse"
   preferences.begin("greenhouse", false);
+
   
   // Restore saved values
   // Ventilation
@@ -161,8 +177,8 @@ void setup() {
   cooling_ventilators_status[2] = preferences.getBool("v3", false);
   cooling_ventilators_status[3] = preferences.getBool("v4", false);
 
-    // Apply loaded states to hardware
-  for (int i = 0; i < 4; i++) {
+  // Apply loaded states to hardware
+  for (int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++) {
     if (relayStatus[i]) {
       turnOnRelay(i+1);
     } else {
@@ -170,14 +186,13 @@ void setup() {
     }
   }
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++) {
     if (cooling_ventilators_status[i]) {
       startVentilator(i+1);
     } else {
       stopVentilator(i+1);
     }
   }
-
 }
 
   
@@ -202,7 +217,6 @@ if (wind_speed_current > ventilation_wind_speed_setpoint){
 }
 
 
-
   // Publish sensor data periodically
   unsigned long now = millis();
   if (now - lastMsg > sensorPollInterval) {
@@ -210,6 +224,7 @@ if (wind_speed_current > ventilation_wind_speed_setpoint){
     readSHT20Data();
     ventilation_control_auto();
     // readWindSpeed();
+
   }
 }
 
@@ -219,12 +234,11 @@ void setup_wifi() {
   Serial.println();
   Serial.print("Connecting to ");
   Serial.println(ssid);
-
-  // Set WiFi to station mode 
-  WiFi.mode(WIFI_STA);
   
   // Disable WiFi power saving mode
   esp_wifi_set_ps(WIFI_PS_NONE);
+  
+
   
   // Begin connection
   WiFi.begin(ssid, password);
@@ -239,7 +253,7 @@ void setup_wifi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("");
-    Serial.println("WiFi connected");
+    Serial.println("WiFi connected successfully");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
   } else {
@@ -264,11 +278,17 @@ void reconnectMQTT() {
       mqttClient.subscribe(topic_ldr_read);
       mqttClient.subscribe(topic_relay_command);
       mqttClient.subscribe(topic_relay_status_get);
+      mqttClient.subscribe(topic_greenhouse_status_get);
+      // Ventilation
       mqttClient.subscribe(topic_ventilation_command);
       mqttClient.subscribe(topic_ventilation_status); 
-      mqttClient.subscribe(topic_greenhouse_status_get);
       mqttClient.subscribe(ventilation_setpoints);
       mqttClient.subscribe(ventilation_setpoints_get);
+      // Cooling
+      mqttClient.subscribe(topic_cooling_command);
+      mqttClient.subscribe(topic_cooling_status);
+      mqttClient.subscribe(topic_cooling_setpoints);
+      mqttClient.subscribe(topic_cooling_setpoints_get);
 
     } else {
       Serial.print("failed, rc=");
@@ -309,6 +329,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   float setpointTemperature = 0;
   int setpointCoefficient = 0;
   int setpointWindSpeed = 0;
+  float setpointEmergencyOffTemperature = 0;
 
   float coolingSetpointTemperature = 0;
   float coolingEmergencyOffTemperature = 0;
@@ -350,7 +371,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         setpointTemperature = doc["ventilation_setpoint_temperature"].as<float>();
         setpointCoefficient = doc["ventilation_setpoint_coefficient"].as<int>();
         setpointWindSpeed = doc["ventilation_setpoint_wind_speed"].as<int>();
-        ventilation_emergency_off_temperature = doc["ventilation_emergency_off_temperature"].as<float>();
+        setpointEmergencyOffTemperature = doc["ventilation_emergency_off_temperature"].as<float>();
       }
       if (doc.containsKey("cooling_setpoint_temperature")) {
         coolingSetpointTemperature = doc["cooling_setpoint_temperature"].as<float>();
@@ -417,7 +438,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     publishGreenhouseStatus();
   }
   else if (topicStr == ventilation_setpoints) {
-    setVentilationSetpoints(setpointTemperature, setpointCoefficient, setpointWindSpeed, ventilation_emergency_off_temperature);
+    setVentilationSetpoints(setpointTemperature, setpointCoefficient, setpointWindSpeed, setpointEmergencyOffTemperature);
   }
   else if (topicStr == ventilation_setpoints_get && actionStr == "get") {
     publishVentilationSetpoints();
@@ -469,7 +490,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 
 // Handle relay command
 void handleRelayCommand(String command) {
-  int relayIndex = 1;
+  uint8_t relayIndex = 1;
   bool turnOn = true;
   
   // Extract relay index (1-based in command, 0-based in array)
@@ -480,8 +501,6 @@ void handleRelayCommand(String command) {
   } else if (command.startsWith("r3")) {
     relayIndex = 3;
   } else if (command.startsWith("r4")) {
-    relayIndex = 4;
-  } else if (command.startsWith("v1")) {
     relayIndex = 4;
   }
   
@@ -509,7 +528,7 @@ void handleRelayCommand(String command) {
     else{
       turnOffRelay(relayIndex);
     }
-    relayStatus[relayIndex -1] = turnOn;
+    relayStatus[relayIndex - 1] = turnOn;
     
     // Update status
     publishRelayStatus(relayIndex);
@@ -538,52 +557,288 @@ void sendMQTTMessage(const char* topic, const char* message) {
 }
 
 
+// Улучшенная функция проверки статуса реле, соответствующая документации Waveshare
+bool getRelayStatus(uint8_t relayNum) {
+  if (relayNum < 1 || relayNum > 32) {
+    Serial.println("Error: Relay number out of range (1-32)");
+    return false;
+  }
+  
+  // Command for reading ALL 32 relay states
+  uint8_t command[8] = {0x01, 0x01, 0x00, 0x00, 0x00, 0x20, 0x3D, 0xD2};
+
+  // Clear receive buffer before sending
+  while (rs485RelaySerial.available()) {
+    rs485RelaySerial.read();
+  }
+
+
+
+  // Send command
+  rs485RelaySerial.write(command, 8);
+  // Switch to receive mode immediately after sending
+  Serial.println("DE/RE LOW (RX mode) - immediately after write");
+  // rs485RelaySerial.flush();
+  delay(80);  // Post-transmission delay (increased for testing)
+
+  // New response reading logic
+  byte response[30];
+  int bytesRead = 0;
+  unsigned long startTime = millis();
+  unsigned long lastByteTime = startTime;
+  const unsigned long BYTE_TIMEOUT = 100;  // 100ms timeout between bytes
+  const unsigned long TOTAL_TIMEOUT = 1000; // 1 second total timeout
+
+  Serial.println("Reading response bytes:");
+
+  // Keep reading while we haven't got 9 bytes and haven't timed out
+  while (bytesRead < 9 && (millis() - startTime) < TOTAL_TIMEOUT) {
+    if (rs485RelaySerial.available() > 0) {
+      response[bytesRead] = rs485RelaySerial.read();
+      Serial.print("Byte ");
+      Serial.print(bytesRead + 1);
+      Serial.print(": 0x");
+      Serial.println(response[bytesRead], HEX);
+      
+      bytesRead++;
+      lastByteTime = millis();
+    } else if ((millis() - lastByteTime) > BYTE_TIMEOUT) {
+      // If no new byte received within timeout, break
+      Serial.println("Timeout waiting for next byte");
+      break;
+    }
+    delay(1);  // Small delay to prevent tight loop
+  }
+
+  Serial.print("Total bytes read: ");
+  Serial.println(bytesRead);
+
+  if (bytesRead > 0) {
+    Serial.print("Complete response: ");
+    for (int i = 0; i < bytesRead; i++) {
+      Serial.print(response[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+
+  bool relayState = false;
+
+  // Expected response: 01 01 04 00 00 00 00 FB D1
+  if (bytesRead == 9 && response[0] == 0x01 && response[1] == 0x01 && response[2] == 0x04) {
+    uint8_t dataByteIndex = (relayNum - 1) / 8;
+    uint8_t bitPosition = (relayNum - 1) % 8;
+    
+    if(dataByteIndex > 3) {
+      Serial.println("Invalid data byte index");
+      return false;
+    }
+    
+    relayState = (response[3 + dataByteIndex] & (1 << bitPosition)) != 0;
+    
+    Serial.print("Relay ");
+    Serial.print(relayNum);
+    Serial.print(" status determined as: ");
+    Serial.println(relayState ? "ON" : "OFF");
+    
+    relayStatus[relayNum - 1] = relayState;
+    
+    // Verify response CRC
+    uint16_t receivedCRC = (response[bytesRead-1] << 8) | response[bytesRead-2];
+    uint16_t calculatedCRC = ModbusCRC16(response, bytesRead-2);
+    
+    if(receivedCRC != calculatedCRC) {
+      Serial.println("CRC mismatch in response");
+      return false;
+    }
+    
+    return relayState;
+    
+  } else {
+    if (bytesRead == 0) {
+      Serial.println("Get Status: No response bytes received");
+    } else {
+      Serial.println("Get Status: Invalid or incomplete response format");
+    }
+  }
+
+  Serial.print("Get Status: Using cached value for relay ");
+  Serial.print(relayNum);
+  Serial.print(": ");
+  Serial.println(relayStatus[relayNum - 1] ? "ON" : "OFF");
+
+  return relayStatus[relayNum - 1];
+}
+
+
+
+
+
+
+
+// Модифицируем turnOnRelay для использования улучшенной функции проверки статуса
 void turnOnRelay(int relayNum) {
-  byte command[] = {0xA0, (byte)relayNum, 0x01, (byte)(0xA0 + relayNum + 1)};
-  int bytesWritten = relaySerial.write(command, sizeof(command));
-  delay(1000);
-  if (bytesWritten == sizeof(command)) {
-    int bytesWritten = relaySerial.write(command, sizeof(command));
-    Serial.println("Relay " + String(relayNum) + " turned on successfully");
-    relayStatus[relayNum - 1] = true;
-    saveRelayState(relayNum, true);
+  if (relayNum < 1 || relayNum > 32) return;
+  
+  // Отправляем команду включения
+  byte commandOn[8];
+  commandOn[0] = 0x01;                // Адрес устройства
+  commandOn[1] = 0x05;                // Функция 05 = Write Single Coil
+  commandOn[2] = 0x00;                // Старший байт адреса реле
+  commandOn[3] = relayNum - 1;        // Младший байт адреса реле (0-31)
+  commandOn[4] = 0xFF;                // Значение ON (старший байт)
+  commandOn[5] = 0x00;                // Значение ON (младший байт)
+  
+  // Рассчитываем CRC
+  uint16_t crc = ModbusCRC16(commandOn, 6);
+  commandOn[6] = crc & 0xFF;          // Младший байт CRC
+  commandOn[7] = (crc >> 8) & 0xFF;   // Старший байт CRC
+  
+  // Очистка буфера
+  while (rs485RelaySerial.available()) {
+    rs485RelaySerial.read();
+  }
+  
+  // Режим передачи с увеличенной задержкой
+  
+  
+  // Отправка команды включения
+  rs485RelaySerial.write(commandOn, 8);
+  rs485RelaySerial.flush();
+  delay(10);
+  
+  // Предполагаем успех и обновляем внутреннее состояние
+  relayStatus[relayNum - 1] = true;
+  
+  // Сохраняем состояние
+  saveRelayState();
+  
+  Serial.print("Relay ");
+  Serial.print(relayNum);
+  Serial.println(" ON command sent");
+  
+  // Задержка перед проверкой статуса
+  delay(200);
+  
+  // Проверяем фактический статус реле с помощью улучшенной функции
+  bool actualStatus = getRelayStatus(relayNum);
+  
+  // Выводим результат сравнения ожидаемого и фактического статуса
+  if (actualStatus) {
+    Serial.println("Relay is verified to be ON");
   } else {
-    Serial.println("Error writing to relay serial port");
-    relayStatus[relayNum - 1] = false;
+    Serial.println("WARNING: Relay should be ON but status check failed!");
   }
 }
 
+// Модифицируем turnOffRelay для использования улучшенной функции проверки статуса
 void turnOffRelay(int relayNum) {
-  byte command[] = {0xA0, (byte)relayNum, 0x00, (byte)(0xA0 + relayNum)};
-  int bytesWritten = relaySerial.write(command, sizeof(command));
-  delay(1000);
-  if (bytesWritten == sizeof(command)) {
-    int bytesWritten = relaySerial.write(command, sizeof(command));
-    Serial.println("Relay " + String(relayNum) + " turned Off successfully");
-    relayStatus[relayNum - 1] = false;
-    saveRelayState(relayNum, false);
+  if (relayNum < 1 || relayNum > 32) return;
+  
+  // Отправляем команду выключения
+  byte commandOff[8];
+  commandOff[0] = 0x01;                // Адрес устройства
+  commandOff[1] = 0x05;                // Функция 05 = Write Single Coil
+  commandOff[2] = 0x00;                // Старший байт адреса реле
+  commandOff[3] = relayNum - 1;        // Младший байт адреса реле (0-31)
+  commandOff[4] = 0x00;                // Значение OFF (старший байт)
+  commandOff[5] = 0x00;                // Значение OFF (младший байт)
+  
+  // Рассчитываем CRC
+  uint16_t crc = ModbusCRC16(commandOff, 6);
+  commandOff[6] = crc & 0xFF;          // Младший байт CRC
+  commandOff[7] = (crc >> 8) & 0xFF;   // Старший байт CRC
+  
+  // Очистка буфера
+  while (rs485RelaySerial.available()) {
+    rs485RelaySerial.read();
+  }
+  
+  // Режим передачи с увеличенной задержкой
+  
+  
+  // Отправка команды выключения
+  rs485RelaySerial.write(commandOff, 8);
+  rs485RelaySerial.flush();
+  delay(10);
+  
+  // Режим приема с увеличенной задержкой
+  
+  // Предполагаем успех и обновляем внутреннее состояние
+  relayStatus[relayNum - 1] = false;
+  
+  // Сохраняем состояние
+  saveRelayState();
+  
+  Serial.print("Relay ");
+  Serial.print(relayNum);
+  Serial.println(" OFF command sent");
+  
+  // Задержка перед проверкой статуса
+  delay(200);
+  
+  // Проверяем фактический статус реле с помощью улучшенной функции
+  bool actualStatus = getRelayStatus(relayNum);
+  
+  // Выводим результат сравнения ожидаемого и фактического статуса
+  if (!actualStatus) {
+    Serial.println("Relay is verified to be OFF");
   } else {
-    Serial.println("Error writing to relay serial port");
-    relayStatus[relayNum - 1] = false;
+    Serial.println("WARNING: Relay should be OFF but status check failed!");
   }
 }
 
+// Тестовая функция для улучшенной версии
+void testEnhancedFunctions() {
+  Serial.println("Testing enhanced relay functions...");
+  
+  // Проверка статуса реле 1
+  Serial.println("Reading status of relay 1...");
+  getRelayStatus(1);
+  delay(1000);
+  
+  // Включение реле 1
+  Serial.println("Turning ON relay 1...");
+  turnOnRelay(1);
+  delay(1000);
+  
+  // Выключение реле 1
+  Serial.println("Turning OFF relay 1...");
+  turnOffRelay(1);
+  delay(1000);
+  
+  Serial.println("Enhanced test completed");
+}
 
 // Function to save relay state
-void saveRelayState(int relayNum, bool state) {
-  String key = "relay" + String(relayNum);
-  preferences.putBool(key.c_str(), state);
+void saveRelayState() {
+    for(int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++){
+    String key = "relay" + String(i+1);
+    preferences.putBool(key.c_str(), relayStatus[i]);
+  }
+  // String key = "relay" + String(relayNum);
+  // preferences.putBool(key.c_str(), state);
 }
 
+// Функции для модуля датчиков
+void preSensorTransmission() {
+  digitalWrite(SENSOR_RS485_CONTROL_PIN, HIGH); // Переключение в режим передачи
+}
 
-// Вызывается перед отправкой запроса (TX-режим)
-void preTransmission() {
-  digitalWrite(RS485_CONTROL_PIN, HIGH);
+void postSensorTransmission() {
+  digitalWrite(SENSOR_RS485_CONTROL_PIN, LOW); // Переключение в режим приема
 }
-// Вызывается после отправки запроса (RX-режим)
-void postTransmission() {
-  digitalWrite(RS485_CONTROL_PIN, LOW);
-}
+
+// void preRelayTransmission() {
+//   digitalWrite(RELAY_RS485_CONTROL_PIN, HIGH);
+//   delay(2); // Увеличьте задержку до 2 мс
+// }
+
+// void postRelayTransmission() {
+//   rs485RelaySerial.flush(); // Убедитесь, что все отправлено
+//   delay(2);
+//   digitalWrite(RELAY_RS485_CONTROL_PIN, LOW);
+// }
 
 void readWindSpeed(){
   const int maxAttempts = 50;  // Maximum number of retry attempts
@@ -593,9 +848,9 @@ void readWindSpeed(){
     // Установить ID устройства (slave ID) для конкретного датчика
     // node.setServerID(2);  // Поменяйте на ID вашего датчика (обычно 1-247)
     // Чтение данных с конкретного регистра
-    uint8_t result = node.readInputRegisters(2, 1);  // Пример: адрес 2, 1 регистра
-    if (result == node.ku8MBSuccess) {
-      uint16_t rawWindSpeed = node.getResponseBuffer(0);
+    uint8_t result = nodeSensor.readInputRegisters(2, 1);  // Пример: адрес 2, 1 регистра
+    if (result == nodeSensor.ku8MBSuccess) {
+      uint16_t rawWindSpeed = nodeSensor.getResponseBuffer(0);
 
       // // Для float значения (4 байта / 2 регистра)
       // union {
@@ -637,13 +892,13 @@ void readSHT20Data() {
   while (attempt < maxAttempts && !success) {
     // Set RS485 to TX mode before reading
     // node.preTransmission(preTransmission);
-    uint8_t result = node.readInputRegisters(1, 2);
+    uint8_t result = nodeSensor.readInputRegisters(1, 2);
     // uint8_t result = node.readHoldingRegisters(1, 2);  // Try this instead
     // Always set RS485 back to RX mode after the read attempt
     // node.postTransmission(postTransmission);
-    if (result == node.ku8MBSuccess) {
-      uint16_t rawTemperature = node.getResponseBuffer(0);
-      uint16_t rawHumidity    = node.getResponseBuffer(1);
+    if (result == nodeSensor .ku8MBSuccess) {
+      uint16_t rawTemperature = nodeSensor.getResponseBuffer(0);
+      uint16_t rawHumidity    = nodeSensor.getResponseBuffer(1);
 
       temperature = rawTemperature / 10.0;
       humidity    = rawHumidity / 10.0;
@@ -663,6 +918,32 @@ void readSHT20Data() {
     Serial.println("Failed to read temperature and humidity sensor data after multiple attempts.");
   }
 }
+
+
+// Функция для вычисления CRC16 Modbus
+uint16_t ModbusCRC16(byte* buf, int len) {
+  uint16_t crc = 0xFFFF;
+  
+  for (int pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];  // XOR байта с текущим значением CRC
+    
+    for (int i = 8; i != 0; i--) {  // Для каждого бита в байте
+      if ((crc & 0x0001) != 0) {    // Если младший бит = 1
+        crc >>= 1;                  // Сдвиг вправо на 1 бит
+        crc ^= 0xA001;              // XOR с полиномом 0xA001
+      } else {                      // Иначе если младший бит = 0
+        crc >>= 1;                  // Просто сдвигаем вправо
+      }
+    }
+  }
+  return crc;
+}
+
+
+
+
+
+
 
 void publishSHT20Data(){
   readSHT20Data();
@@ -903,31 +1184,43 @@ void publishVentilationSetpoints(){
 //Cooling System
 
 
-void startVentilator(int ventilatorIndex){
-  if(ventilatorIndex < 0 || ventilatorIndex > 4) return;
-  turnOnRelay(ventilatorIndex);
-  if(relayStatus[ventilatorIndex-1]){
-    cooling_ventilators_status[ventilatorIndex-1] = true;
-    String key = "v" + String(ventilatorIndex);
-    preferences.putBool(key.c_str(), true);
-    Serial.println("Ventilator " + String(ventilatorIndex) + " turned on successfully");
-    publishCoolingStatus();
+void startVentilator(int ventilatorIndex) {
+  if(ventilatorIndex >= 1 && ventilatorIndex <= 4){
+    // Вентилятор 1 = реле 5, вентилятор 2 = реле 6, и т.д.
+    int relayIndex = ventilatorIndex + 3;
+    turnOnRelay(relayIndex);
+    delay(100);
+    if(relayStatus[relayIndex-1]){ // Массив relayStatus индексируется с 0
+      cooling_ventilators_status[ventilatorIndex-1] = true;
+      String key = "v" + String(ventilatorIndex);
+      preferences.putBool(key.c_str(), true);
+      Serial.println("Ventilator " + String(ventilatorIndex) + " turned on successfully");
+      publishCoolingStatus();
+    }else{
+      Serial.println("Ventilator " + String(ventilatorIndex) + " turn on error");
+    }
   }else{
-    Serial.println("Ventilator " + String(ventilatorIndex) + " turn on error");
+    Serial.println("Invalid ventilator index");
   }
 }
 
-void stopVentilator(int ventilatorIndex){
-  if(ventilatorIndex < 0 || ventilatorIndex > 4) return;
-  turnOffRelay(ventilatorIndex);
-  if(!relayStatus[ventilatorIndex-1]){
-    cooling_ventilators_status[ventilatorIndex-1] = false;
-    String key = "v" + String(ventilatorIndex);
-    preferences.putBool(key.c_str(), false);
-    Serial.println("Ventilator " + String(ventilatorIndex) + " turned off successfully");
-    publishCoolingStatus();
+void stopVentilator(int ventilatorIndex) {
+  if(ventilatorIndex >= 1 && ventilatorIndex <= 4){
+    // Вентилятор 1 = реле 5, вентилятор 2 = реле 6, и т.д.
+    int relayIndex = ventilatorIndex + 3;
+    turnOffRelay(relayIndex);
+    delay(100);
+    if(!relayStatus[relayIndex-1]){ // Проверяем, что реле действительно выключено
+      cooling_ventilators_status[ventilatorIndex-1] = false;
+      String key = "v" + String(ventilatorIndex);
+      preferences.putBool(key.c_str(), false);
+      Serial.println("Ventilator " + String(ventilatorIndex) + " turned off successfully");
+      publishCoolingStatus();
+    }else{
+      Serial.println("Ventilator " + String(ventilatorIndex) + " turn off error");
+    }
   }else{
-    Serial.println("Ventilator " + String(ventilatorIndex) + " turn off error");
+    Serial.println("Invalid ventilator index");
   }
 }
 
@@ -948,13 +1241,13 @@ void publishCoolingSetpoints(){
 void publishCoolingStatus(){
   StaticJsonDocument<200> doc;
   doc["status"] = cooling_system_active;
-  for(int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++){
-    doc["v" + String(i+1)] = cooling_ventilators_status[i];
-  }
+  doc["ventilators"] = cooling_ventilators_status;
+  doc["water_pump"] = cooling_water_pump_status;
   doc["water_pump"] = cooling_water_pump_status;
   doc["cooling_control_auto_state"] = cooling_control_auto_state;
   doc["client_id"] = mqtt_client_id;
   doc["greenhouse_id"] = greenhouse_id;
+
   
   char buffer[200];
   serializeJson(doc, buffer);
@@ -1013,7 +1306,7 @@ void cooling_system_start(int percent) {
     Serial.println("Waiting for ventilation to close before starting cooling system");
     // Close ventilation first
     ventilation_control_open_percent(0);
-     
+    
     // Wait until ventilation is fully closed
     unsigned long startWaitTime = millis();
     const unsigned long maxWaitTime = 60000; // Maximum wait time: 60 seconds
@@ -1051,6 +1344,9 @@ void cooling_system_start(int percent) {
   
   // Normalize percent value
   percent = constrain(percent, 0, 100);
+  
+  // Сначала остановим все вентиляторы для определенности
+  cooling_system_stop_ventilators();
   
   // Turn on cooling fans based on percentage
   if (percent >= 25) {
@@ -1110,21 +1406,20 @@ void cooling_system_stop(){
   }
 }
 
-void cooling_system_stop_ventilators(){
-  for(int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++){
-    stopVentilator(i+1);
+void cooling_system_stop_ventilators() {
+  for (int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++) {
+    // Вентилятор имеет индекс i+1 (от 1 до 4)
+    stopVentilator(i+1); 
     delay(100);
-    if(relayStatus[i]){
-      cooling_ventilators_status[i] = true;
-    }else{
-      cooling_ventilators_status[i] = false;
-    }
+  }
+  // Убедимся, что все флаги выключены
+  for (int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++) {
+    cooling_ventilators_status[i] = false;
   }
   cooling_system_active = false;
   saveCoolingSettings();
   publishCoolingStatus();
 }
-
 
 void cooling_system_stop_water_pump(){
   turnOffRelay(2);
@@ -1133,3 +1428,4 @@ void cooling_system_stop_water_pump(){
   }
   preferences.putBool("cooling_water_pump_status", cooling_water_pump_status);
 }
+

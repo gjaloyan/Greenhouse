@@ -133,9 +133,9 @@ MQTTClient.onMessage(TOPICS.VENTILATION_STATUS, (topic, message) => {
 MQTTClient.onMessage(TOPICS.VENTILATION_SETPOINTS_GET, (topic, message) => {
     try {
         let messageStr = message.toString().trim();
-        
+        const data = JSON.parse(messageStr);
         // Проверяем только на команду "get", но не на название топика
-        if (messageStr === "get") {
+        if (data.action === "get") {
             console.log(`Ignoring get command in setpoints topic`);
             return;
         }
@@ -157,7 +157,7 @@ MQTTClient.onMessage(TOPICS.VENTILATION_SETPOINTS_GET, (topic, message) => {
         
         // Try to parse as JSON
         try {
-            const data = JSON.parse(messageStr);
+            
             console.log("Setpoints data received:", data);
             
             // Skip command messages
@@ -466,6 +466,7 @@ const getVentilationSetpoints = async (req, res) => {
             ...lastVentilationSetpoints,
             name: VENTILATION.name,
             description: VENTILATION.description
+
         };
         
         return res.json(setpoints);
