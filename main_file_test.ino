@@ -13,7 +13,6 @@ Preferences preferences;
 // Для модуля MAX485, подключенного к датчикам
 #define SENSOR_RS485_RX_PIN   16   // UART2 RX 
 #define SENSOR_RS485_TX_PIN   17   // UART2 TX
-#define SENSOR_RS485_CONTROL_PIN 4 // DE/RE pin
 
 // Для модуля MAX485, подключенного к реле
 #define RELAY_RS485_RX_PIN   26    // Измените с GPIO3 на GPIO26
@@ -81,7 +80,7 @@ ModbusMaster nodeRelay;  // Для реле
 // Variables
 unsigned long lastMsg = 0;
 unsigned long sensorPollInterval = 10000; // 3 seconds
-bool relayStatus[4] = {false, false, false, false};
+bool relayStatus[32] = {false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false};
 float temperature = 0.0;
 float humidity    = 0.0;
 
@@ -106,28 +105,20 @@ float cooling_emergency_off_temperature = 0;
 bool cooling_control_auto_state = false;
 bool cooling_system_active = false;
 bool cooling_water_pump_status = false;
-bool cooling_ventilators_status[4] = {false, false, false, false};
+int cooling_ventilators_count = 0;
+bool cooling_ventilators_status[];
+
+
 
 // int cooling_ventilators_intensity_setpoint = 0;
 
 void setup() {
   // Start Serial for debugging
   Serial.begin(9600);
-  Serial.println("\n\nInitializing system...");
-
-
-
-
-
-  
+  Serial.println("\n\nInitializing system...");  
   // Early WiFi initialization
   WiFi.mode(WIFI_STA);
 
-   // Настройка пинов управления RS485
-  pinMode(SENSOR_RS485_CONTROL_PIN, OUTPUT);
-  digitalWrite(SENSOR_RS485_CONTROL_PIN, LOW); // Режим приема
-
-  
   // Инициализация UART для датчиков
   rs485SensorSerial.begin(9600, SERIAL_8N1, SENSOR_RS485_RX_PIN, SENSOR_RS485_TX_PIN);
   
@@ -142,16 +133,9 @@ void setup() {
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqtt_callback);
   
-  // Инициализация ModbusMaster для датчиков
-  nodeSensor.begin(1, rs485SensorSerial);
-  nodeSensor.preTransmission(preSensorTransmission);
-  nodeSensor.postTransmission(postSensorTransmission);
-  
-
   // Open preferences with namespace "greenhouse"
   preferences.begin("greenhouse", false);
 
-  
   // Restore saved values
   // Ventilation
   ventilation_temperature_setpoint = preferences.getFloat("temp_setpoint", 20.0); // Default 26.0
@@ -164,18 +148,17 @@ void setup() {
   cooling_emergency_off_temperature = preferences.getFloat("cooling_emergency_off_temperature", 0); // Default 0%
   cooling_control_auto_state = preferences.getBool("cooling_control_auto_state", false); // Default false
   cooling_system_active = preferences.getBool("cooling_system_active", false); // Default false
-  
-  // You could also load relay states
-  relayStatus[0] = preferences.getBool("relay1", false);
-  relayStatus[1] = preferences.getBool("relay2", false);
-  relayStatus[2] = preferences.getBool("relay3", false);
-  relayStatus[3] = preferences.getBool("relay4", false);
+  cooling_ventilators_count = preferences.getInt("cooling_ventilators_count", 0); // Default 0
 
-  // Ventilators
-  cooling_ventilators_status[0] = preferences.getBool("v1", false);
-  cooling_ventilators_status[1] = preferences.getBool("v2", false);
-  cooling_ventilators_status[2] = preferences.getBool("v3", false);
-  cooling_ventilators_status[3] = preferences.getBool("v4", false);
+  for (int i = 0; i < cooling_ventilators_count; i++) {
+    cooling_ventilators_status[i] = preferences.getBool("v" + String(i+1), false);
+  }
+
+
+  for (int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++) {
+    relayStatus[i] = preferences.getBool("relay" + String(i+1), false);
+  }
+
 
   // Apply loaded states to hardware
   for (int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++) {
@@ -563,111 +546,67 @@ bool getRelayStatus(uint8_t relayNum) {
     Serial.println("Error: Relay number out of range (1-32)");
     return false;
   }
-  
-  // Command for reading ALL 32 relay states
-  uint8_t command[8] = {0x01, 0x01, 0x00, 0x00, 0x00, 0x20, 0x3D, 0xD2};
 
-  // Clear receive buffer before sending
-  while (rs485RelaySerial.available()) {
-    rs485RelaySerial.read();
-  }
+  // Modbus RTU request to read all 32 relays
+  uint8_t request[8] = {0x01, 0x01, 0x00, 0x00, 0x00, 0x20, 0x3D, 0xD2};
 
+  // Clear UART RX buffer
+  while (rs485RelaySerial.available()) rs485RelaySerial.read();
 
+  // Send request (XY485 has auto‑direction, no DE/RE control needed)
+  rs485RelaySerial.write(request, 8);
+  rs485RelaySerial.flush();
 
-  // Send command
-  rs485RelaySerial.write(command, 8);
-  // Switch to receive mode immediately after sending
-  Serial.println("DE/RE LOW (RX mode) - immediately after write");
-  // rs485RelaySerial.flush();
-  delay(80);  // Post-transmission delay (increased for testing)
-
-  // New response reading logic
-  byte response[30];
-  int bytesRead = 0;
-  unsigned long startTime = millis();
-  unsigned long lastByteTime = startTime;
-  const unsigned long BYTE_TIMEOUT = 100;  // 100ms timeout between bytes
-  const unsigned long TOTAL_TIMEOUT = 1000; // 1 second total timeout
-
-  Serial.println("Reading response bytes:");
-
-  // Keep reading while we haven't got 9 bytes and haven't timed out
-  while (bytesRead < 9 && (millis() - startTime) < TOTAL_TIMEOUT) {
-    if (rs485RelaySerial.available() > 0) {
-      response[bytesRead] = rs485RelaySerial.read();
-      Serial.print("Byte ");
-      Serial.print(bytesRead + 1);
-      Serial.print(": 0x");
-      Serial.println(response[bytesRead], HEX);
-      
-      bytesRead++;
-      lastByteTime = millis();
-    } else if ((millis() - lastByteTime) > BYTE_TIMEOUT) {
-      // If no new byte received within timeout, break
-      Serial.println("Timeout waiting for next byte");
-      break;
+  // Wait for response (expect 9 bytes: 01 01 04 00 00 00 00 FB D1)
+  const unsigned long RESPONSE_TIMEOUT = 1000; // 1 s
+  unsigned long start = millis();
+  uint8_t response[16];
+  int len = 0;
+  while ((millis() - start) < RESPONSE_TIMEOUT && len < 9) {
+    if (rs485RelaySerial.available()) {
+      response[len++] = rs485RelaySerial.read();
     }
-    delay(1);  // Small delay to prevent tight loop
   }
 
-  Serial.print("Total bytes read: ");
-  Serial.println(bytesRead);
-
-  if (bytesRead > 0) {
-    Serial.print("Complete response: ");
-    for (int i = 0; i < bytesRead; i++) {
-      Serial.print(response[i], HEX);
-      Serial.print(" ");
+  // Debug output
+  Serial.print("Bytes received: "); Serial.println(len);
+  if (len) {
+    Serial.print("Response: ");
+    for (int i = 0; i < len; i++) {
+      Serial.printf("%02X ", response[i]);
     }
     Serial.println();
   }
 
-  bool relayState = false;
-
-  // Expected response: 01 01 04 00 00 00 00 FB D1
-  if (bytesRead == 9 && response[0] == 0x01 && response[1] == 0x01 && response[2] == 0x04) {
-    uint8_t dataByteIndex = (relayNum - 1) / 8;
-    uint8_t bitPosition = (relayNum - 1) % 8;
-    
-    if(dataByteIndex > 3) {
-      Serial.println("Invalid data byte index");
-      return false;
-    }
-    
-    relayState = (response[3 + dataByteIndex] & (1 << bitPosition)) != 0;
-    
-    Serial.print("Relay ");
-    Serial.print(relayNum);
-    Serial.print(" status determined as: ");
-    Serial.println(relayState ? "ON" : "OFF");
-    
-    relayStatus[relayNum - 1] = relayState;
-    
-    // Verify response CRC
-    uint16_t receivedCRC = (response[bytesRead-1] << 8) | response[bytesRead-2];
-    uint16_t calculatedCRC = ModbusCRC16(response, bytesRead-2);
-    
-    if(receivedCRC != calculatedCRC) {
-      Serial.println("CRC mismatch in response");
-      return false;
-    }
-    
-    return relayState;
-    
-  } else {
-    if (bytesRead == 0) {
-      Serial.println("Get Status: No response bytes received");
-    } else {
-      Serial.println("Get Status: Invalid or incomplete response format");
-    }
+  // Basic validation
+  if (len < 9 || response[0] != 0x01 || response[1] != 0x01 || response[2] != 0x04) {
+    Serial.println("Invalid / incomplete response");
+    return relayStatus[relayNum - 1]; // return cached value
   }
 
-  Serial.print("Get Status: Using cached value for relay ");
-  Serial.print(relayNum);
-  Serial.print(": ");
-  Serial.println(relayStatus[relayNum - 1] ? "ON" : "OFF");
+  // CRC check
+  uint16_t recvCRC = (response[8] << 8) | response[7];
+  uint16_t calcCRC = ModbusCRC16(response, 7);
+  if (recvCRC != calcCRC) {
+    Serial.println("CRC mismatch");
+    return relayStatus[relayNum - 1];
+  }
 
-  return relayStatus[relayNum - 1];
+  // Parse relay bit with reversed byte order: last data byte contains relays 1‑8
+  uint8_t dataByteIndex = 3 - ((relayNum - 1) / 8);  // byte3 => relays 1‑8, byte0 => relays 25‑32
+  uint8_t bitPos        = (relayNum - 1) % 8;
+  uint8_t dataByte      = response[3 + dataByteIndex];
+
+  bool state = (dataByte >> bitPos) & 0x01;
+
+  Serial.print("Data byte index="); Serial.print(dataByteIndex);
+  Serial.print(" value=0x"); Serial.print(dataByte, HEX);
+  Serial.print(" bitPos="); Serial.print(bitPos);
+  Serial.print(" => state="); Serial.println(state);
+
+  relayStatus[relayNum - 1] = state;
+
+  return state;
 }
 
 
@@ -820,25 +759,6 @@ void saveRelayState() {
   // preferences.putBool(key.c_str(), state);
 }
 
-// Функции для модуля датчиков
-void preSensorTransmission() {
-  digitalWrite(SENSOR_RS485_CONTROL_PIN, HIGH); // Переключение в режим передачи
-}
-
-void postSensorTransmission() {
-  digitalWrite(SENSOR_RS485_CONTROL_PIN, LOW); // Переключение в режим приема
-}
-
-// void preRelayTransmission() {
-//   digitalWrite(RELAY_RS485_CONTROL_PIN, HIGH);
-//   delay(2); // Увеличьте задержку до 2 мс
-// }
-
-// void postRelayTransmission() {
-//   rs485RelaySerial.flush(); // Убедитесь, что все отправлено
-//   delay(2);
-//   digitalWrite(RELAY_RS485_CONTROL_PIN, LOW);
-// }
 
 void readWindSpeed(){
   const int maxAttempts = 50;  // Maximum number of retry attempts
@@ -885,38 +805,52 @@ void readWindSpeed(){
 }
 
 
-void readSHT20Data() {
-  const int maxAttempts = 50;  // Maximum number of retry attempts
+// Reads temperature & humidity from SHT20 sensor via XY485 (no ModbusMaster)
+bool readSHT20Data() {
+  const int maxAttempts = 10;
   int attempt = 0;
-  bool success = false;
-  while (attempt < maxAttempts && !success) {
-    // Set RS485 to TX mode before reading
-    // node.preTransmission(preTransmission);
-    uint8_t result = nodeSensor.readInputRegisters(1, 2);
-    // uint8_t result = node.readHoldingRegisters(1, 2);  // Try this instead
-    // Always set RS485 back to RX mode after the read attempt
-    // node.postTransmission(postTransmission);
-    if (result == nodeSensor .ku8MBSuccess) {
-      uint16_t rawTemperature = nodeSensor.getResponseBuffer(0);
-      uint16_t rawHumidity    = nodeSensor.getResponseBuffer(1);
+  while (attempt < maxAttempts) {
+    // Build Modbus RTU request: Addr=1, Fn=0x04, Start=0x0001, Qty=0x0002
+    uint8_t request[8] = {0x01, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00};
+    uint16_t crc = ModbusCRC16(request, 6);
+    request[6] = crc & 0xFF;
+    request[7] = crc >> 8;
 
-      temperature = rawTemperature / 10.0;
-      humidity    = rawHumidity / 10.0;
+    // Clear RX buffer
+    while (rs485SensorSerial.available()) rs485SensorSerial.read();
 
-      success = true;
+    // Send request (XY485 auto‑direction)
+    rs485SensorSerial.write(request, 8);
+    rs485SensorSerial.flush();
 
-    } else {
-      Serial.print("Modbus temperature and humidity read error. Code: 0x");
-      Serial.println(result, HEX);
-      attempt++;
-      // Increase delay to allow the sensor more time to respond
-      delay(500);  
+    // Wait for response (expect 9 bytes: 01 04 04 T_hi T_lo H_hi H_lo CRC_lo CRC_hi)
+    const unsigned long timeout = 500; // ms
+    uint8_t resp[16];
+    int len = 0;
+    unsigned long start = millis();
+    while ((millis() - start) < timeout && len < 9) {
+      if (rs485SensorSerial.available()) resp[len++] = rs485SensorSerial.read();
     }
-  }
 
-  if (!success) {
-    Serial.println("Failed to read temperature and humidity sensor data after multiple attempts.");
+    if (len == 9 && resp[0] == 0x01 && resp[1] == 0x04 && resp[2] == 0x04) {
+      uint16_t recvCRC = (resp[8] << 8) | resp[7];
+      uint16_t calcCRC = ModbusCRC16(resp, 7);
+      if (recvCRC == calcCRC) {
+        uint16_t rawT = (resp[3] << 8) | resp[4];
+        uint16_t rawH = (resp[5] << 8) | resp[6];
+        temperature = rawT / 10.0;
+        humidity    = rawH / 10.0;
+        // Serial.print("Temp: "); Serial.print(temperature);
+        // Serial.print(" °C, Hum: "); Serial.print(humidity); Serial.println(" %");
+        return true;
+      }
+    }
+    Serial.println("SHT20 read failed, retry...");
+    attempt++;
+    delay(100);
   }
+  Serial.println("Failed to read SHT20 after attempts");
+  return false;
 }
 
 
@@ -968,6 +902,34 @@ void publishAllRelayStatus() {
   doc["r2"] = relayStatus[1] ? "ON" : "OFF";
   doc["r3"] = relayStatus[2] ? "ON" : "OFF";
   doc["r4"] = relayStatus[3] ? "ON" : "OFF";
+  doc["r5"] = relayStatus[4] ? "ON" : "OFF";
+  doc["r6"] = relayStatus[5] ? "ON" : "OFF";
+  doc["r7"] = relayStatus[6] ? "ON" : "OFF";
+  doc["r8"] = relayStatus[7] ? "ON" : "OFF";
+  doc["r9"] = relayStatus[8] ? "ON" : "OFF";
+  doc["r10"] = relayStatus[9] ? "ON" : "OFF";
+  doc["r11"] = relayStatus[10] ? "ON" : "OFF";
+  doc["r12"] = relayStatus[11] ? "ON" : "OFF";
+  doc["r13"] = relayStatus[12] ? "ON" : "OFF";
+  doc["r14"] = relayStatus[13] ? "ON" : "OFF";
+  doc["r15"] = relayStatus[14] ? "ON" : "OFF";
+  doc["r16"] = relayStatus[15] ? "ON" : "OFF";
+  doc["r17"] = relayStatus[16] ? "ON" : "OFF";
+  doc["r18"] = relayStatus[17] ? "ON" : "OFF";
+  doc["r19"] = relayStatus[18] ? "ON" : "OFF";
+  doc["r20"] = relayStatus[19] ? "ON" : "OFF";
+  doc["r21"] = relayStatus[20] ? "ON" : "OFF";
+  doc["r22"] = relayStatus[21] ? "ON" : "OFF";
+  doc["r23"] = relayStatus[22] ? "ON" : "OFF";
+  doc["r24"] = relayStatus[23] ? "ON" : "OFF";
+  doc["r25"] = relayStatus[24] ? "ON" : "OFF";
+  doc["r26"] = relayStatus[25] ? "ON" : "OFF";
+  doc["r27"] = relayStatus[26] ? "ON" : "OFF";
+  doc["r28"] = relayStatus[27] ? "ON" : "OFF";
+  doc["r29"] = relayStatus[28] ? "ON" : "OFF";
+  doc["r30"] = relayStatus[29] ? "ON" : "OFF";
+  doc["r31"] = relayStatus[30] ? "ON" : "OFF";
+  doc["r32"] = relayStatus[31] ? "ON" : "OFF";
   doc["greenhouse_id"] = greenhouse_id;
   
   char buffer[200];
@@ -979,12 +941,13 @@ void publishAllRelayStatus() {
 
 // Publish status of a specific relay
 void publishRelayStatus(int relayIndex) {
-  if (relayIndex < 0 || relayIndex > 4) return;
+  if (relayIndex < 0 || relayIndex > 32) return;
   
-  String relayId = "r" + String(relayIndex);
-  int relay = relayIndex - 1;
   String state;
-  if(relayStatus[relay]){
+
+  String relayId = "r" + String(relayIndex);
+
+  if(getRelayStatus(relayIndex)){
     state = "ON";
   }else{
     state = "OFF";

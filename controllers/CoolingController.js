@@ -40,7 +40,7 @@ function getFormattedDateTime() {
 
 // State storage
 let lastCoolingState = { state: 'unknown', percent: 0, waterPump: false, ventilators: [false, false, false, false], lastUpdate: getFormattedDateTime() };
-let lastCoolingSetpoints = { targetTemperature: 0, emergencyOffTemperature: 0, lastUpdate: getFormattedDateTime() };
+let lastCoolingSetpoints = { ventilatorsCount: 0, targetTemperature: 0, emergencyOffTemperature: 0, lastUpdate: getFormattedDateTime() };
 let statusUpdatePromiseResolver = null;
 let setpointsUpdatePromiseResolver = null;
 let lastStatusUpdate = getFormattedDateTime();
@@ -178,13 +178,14 @@ MQTTClient.onMessage(TOPICS.COOLING_SETPOINTS_GET, (topic, message) => {
             }
             
             lastCoolingSetpoints = {
+                ventilatorsCount: data.ventilators_count,
                 targetTemperature: data.target_temperature,
                 emergencyOffTemperature: data.emergency_off_temperature,
                 lastUpdate: getFormattedDateTime()
             };  
             updateCoolingSetpoints(lastCoolingSetpoints);
 
-            console.log(`Received cooling setpoints from ESP: temp=${lastCoolingSetpoints.targetTemperature}, emergencyOffTemperature=${lastCoolingSetpoints.emergencyOffTemperature}`);
+            console.log(`Received cooling setpoints from ESP: ventilatorsCount=${lastCoolingSetpoints.ventilatorsCount}, temp=${lastCoolingSetpoints.targetTemperature}, emergencyOffTemperature=${lastCoolingSetpoints.emergencyOffTemperature}`);
         } catch (error) {
             // Not a valid JSON
             console.log(`Received non-JSON message in cooling setpoints topic: ${messageStr}`);
