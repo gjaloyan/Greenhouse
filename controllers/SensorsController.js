@@ -21,6 +21,12 @@ const sensorConfig = {
   }
 };
 
+// Check MQTT connection
+async function checkConnection() {
+  const status = await MQTTClient.checkGreenhouse();
+  return status;
+}
+
 // Cache structure for sensor data
 const sensorCache = new Map();
 const DATA_CACHE_TIME = 5000; // ms (5 seconds)
@@ -162,6 +168,10 @@ const getSensorData = async (sensorId, forceRefresh = false) => {
  * HTTP controller for getting a specific sensor's data
  */
 const getSensor = async (req, res) => {
+  const ConnectionStatus = await checkConnection();
+  if (!ConnectionStatus.success) {
+      return res.status(503).json(ConnectionStatus);
+  }
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json(errors.array()[0].msg);
@@ -194,11 +204,9 @@ const getAllSensors = async (req, res) => {
   const forceRefresh = req.query.refresh === 'true';
   
   try {
-    if (!MQTTClient.isConnected()) {
-      return res.status(503).json({
-        message: 'MQTT server unavailable',
-        status: false
-      });
+    const ConnectionStatus = await checkConnection();
+    if (!ConnectionStatus.success) {
+        return res.status(503).json(ConnectionStatus);
     }
     
     // Collect data from all sensors

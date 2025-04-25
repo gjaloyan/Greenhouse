@@ -42,7 +42,7 @@ function getFormattedDateTime() {
 }
 
 // State storage
-let lastVentilationState = { state: 'unknown', percent: 0, lastUpdate: getFormattedDateTime() };
+let lastVentilationState = { state: 'unknown', percent: 0, auto: false, lastUpdate: getFormattedDateTime() };
 let lastVentilationSetpoints = { temperature: 0, coefficient: 0, windSpeed: 0, emergencyOffTemperature: 0, lastUpdate: getFormattedDateTime() };
 let statusUpdatePromiseResolver = null;
 let lastStatusUpdate = getFormattedDateTime();
@@ -103,6 +103,7 @@ MQTTClient.onMessage(TOPICS.VENTILATION_STATUS, (topic, message) => {
             const state = {
                 state: data.status || 'unknown',
                 percent: data.percent !== undefined ? Number(data.percent) : 0,
+                auto: data.auto_control !== undefined ? data.auto_control : false,
                 lastUpdate: getFormattedDateTime()
             };
             
@@ -120,6 +121,7 @@ MQTTClient.onMessage(TOPICS.VENTILATION_STATUS, (topic, message) => {
             const state = {
                 state: messageStr,
                 percent: messageStr === 'open' ? 100 : messageStr === 'closed' ? 0 : lastVentilationState.percent,
+                auto: lastVentilationState.auto,
                 lastUpdate: formattedTime
             };
             updateVentilationState(state);
@@ -207,7 +209,7 @@ function updateVentilationState(newState) {
 // Check MQTT connection
 async function checkConnection() {
     const status = await MQTTClient.checkGreenhouse();
-    return status.success;
+    return status;
 }
 
 // Send command to ESP
@@ -245,6 +247,7 @@ async function getVentilationState() {
         description: VENTILATION.description,
         state: lastVentilationState.state,
         percent: lastVentilationState.percent,
+        auto: lastVentilationState.auto,
         lastUpdate: lastVentilationState.lastUpdate,
         source: 'Greenhouse'
     };
@@ -386,8 +389,9 @@ async function setVentilationSetpoints(temperature, coefficient, windSpeed) {
 // Set ventilation percentage
 const setVentilation = async (req, res) => {
     try {
-        if (!await checkConnection()) {
-            return res.status(503).json({ message: 'MQTT server unavailable', success: false });
+        const ConnectionStatus = await checkConnection();
+        if (!ConnectionStatus.success) {
+            return res.status(503).json(ConnectionStatus);
         }
         
         // Get and validate percent
@@ -431,8 +435,9 @@ const setVentilation = async (req, res) => {
 // Get ventilation status
 const getVentilationStatus = async (req, res) => {
     try {
-        if (!await checkConnection()) {
-            return res.status(503).json({ message: 'MQTT server unavailable', success: false });
+        const ConnectionStatus = await checkConnection();
+        if (!ConnectionStatus.success) {
+            return res.status(503).json(ConnectionStatus);
         }
         const status = await getVentilationState();
         return res.json(status);
@@ -445,8 +450,9 @@ const getVentilationStatus = async (req, res) => {
 // Get setpoints
 const getVentilationSetpoints = async (req, res) => {
     try {
-        if (!await checkConnection()) {
-            return res.status(503).json({ message: 'MQTT server unavailable', success: false });
+        const ConnectionStatus = await checkConnection();
+        if (!ConnectionStatus.success) {
+            return res.status(503).json(ConnectionStatus);
         }
         // Request fresh data from ESP32
         try {
@@ -479,8 +485,9 @@ const getVentilationSetpoints = async (req, res) => {
 // Update setpoints
 const updateVentilationSetpoints = async (req, res) => {
     try {
-        if (!await checkConnection()) {
-            return res.status(503).json({ message: 'MQTT server unavailable', success: false });
+        const ConnectionStatus = await checkConnection();
+        if (!ConnectionStatus.success) {
+            return res.status(503).json(ConnectionStatus);
         }
         
         const { temperature, coefficient, windSpeed } = req.body;

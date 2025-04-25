@@ -85,40 +85,10 @@ function updateRelayState(relayId, state) {
  * 
  * @returns {Promise<boolean>} True if connected, false otherwise
  */
+// Check MQTT connection
 async function checkConnection() {
-  
-  // Then check greenhouse connection
-  if (MQTTClient.checkGreenhouse()) return true;
-
-  try {
-    // Attempt reconnection if the method exists
-    if (typeof MQTTClient.reconnect === 'function') {
-      const reconnected = await MQTTClient.reconnect();
-      if (reconnected) {
-        console.log('Reconnected to MQTT broker');
-        // Re-subscribe to status topic after reconnection
-        await MQTTClient.subscribeToTopic(TOPICS.STATUS);
-        return true;
-      }
-    }
-    console.log('MQTT disconnected and reconnection failed');
-    return false;
-  } catch (error) {
-    // Log any errors that occur during connection check
-    console.error('Connection check error:', error.message);
-    return false;
-  }
-}
-
-async function publishToESP(topic, message) {
-  if (!await checkConnection())
-    throw new Error('MQTT server unavailable');
-    
-  const result = await MQTTClient.publishToTopic(topic, message);
-  if (!result?.success)
-    throw new Error(`Failed to publish: ${result?.error || 'Unknown error'}`);
-    
-  return result;
+  const status = await MQTTClient.checkGreenhouse();
+  return status;
 }
 
 async function requestRelayStatus(target = 'all') {
@@ -138,8 +108,9 @@ async function requestRelayStatus(target = 'all') {
     
     // Request fresh status
     try {
-      if (await checkConnection()) {
-        await publishToESP(TOPICS.STATUS_REQUEST, target);
+      const ConnectionStatus = await checkConnection();
+      if (ConnectionStatus.success) {
+        await MQTTClient.publishToTopic(TOPICS.STATUS_REQUEST, target);
         await new Promise(resolve => setTimeout(resolve, TIMEOUT.ESP_RESPONSE));
         }
     } catch (error) {
@@ -181,7 +152,7 @@ async function controlRelay(relayId, state) {
     console.log(`Initial state of ${relayId}: ${initialState}`);
     
     // Send command
-    await publishToESP(TOPICS.COMMAND, command);
+    await MQTTClient.publishToTopic(TOPICS.COMMAND, command);
     console.log(`Command sent to ${relayId}: ${state}`);
     
     // Wait for ESP to process
@@ -286,11 +257,9 @@ MQTTClient.onMessage(TOPICS.STATUS, (topic, message) => {
  */
 const getRelayStatus = async (req, res) => {
   try {
-    if (!await checkConnection()) {
-      return res.status(503).json({
-        message: 'MQTT server unavailable',
-        success: false
-      });
+    const ConnectionStatus = await checkConnection();
+    if (!ConnectionStatus.success) {
+        return res.status(503).json(ConnectionStatus);
     }
     
     const states = await requestRelayStatus('all');
@@ -314,6 +283,10 @@ const getRelayStatus = async (req, res) => {
  */
 const getSpecificRelayStatus = async (req, res) => {
   try {
+    const ConnectionStatus = await checkConnection();
+    if (!ConnectionStatus.success) {
+        return res.status(503).json(ConnectionStatus);
+    }
     const relayId = req.params.relayId;
     
     if (!relayConfig[relayId]) {
@@ -323,12 +296,6 @@ const getSpecificRelayStatus = async (req, res) => {
       });
     }
     
-    if (!await checkConnection()) {
-      return res.status(503).json({
-        message: 'MQTT server unavailable',
-        success: false
-      });
-    }
     
     const state = await requestRelayStatus(relayId);
     const lastUpdate = relayStates.get(relayId)?.lastUpdate || 0;
@@ -365,17 +332,15 @@ async function controlRelayEndpoint(req, res, state) {
       });
     }
     
-    if (!await checkConnection()) {
-      return res.status(503).json({
-        message: 'MQTT server unavailable',
-        success: false
-      });
+    const ConnectionStatus = await checkConnection();
+    if (!ConnectionStatus.success) {
+        return res.status(503).json(ConnectionStatus);
     }
     
     const result = await controlRelay(relayId, state);
     
     if (!result.success) {
-      return res.status(503).json({
+        return res.status(503).json({
         message: result.error || 'Failed to control relay',
         success: false,
         relayId,
@@ -415,10 +380,14 @@ const sendRelayCommandOff = (req, res) => controlRelayEndpoint(req, res, 'OFF');
  */
 const getRelayList = async (req, res) => {
   try {
-    // Try to get states but don't fail if it doesn't work
-    const states = await checkConnection() 
-      ? await requestRelayStatus('all').catch(() => ({}))
-      : {};
+
+    // Check MQTT connection
+    const ConnectionStatus = await checkConnection();
+    if (!ConnectionStatus.success) {
+        return res.status(503).json(ConnectionStatus);
+    }
+    // Check MQTT connection
+    await requestRelayStatus('all').catch(() => ({}))
     
     const relays = Object.entries(relayConfig).map(([relayId, config]) => ({
       relayId,

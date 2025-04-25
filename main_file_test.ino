@@ -55,8 +55,8 @@ const char* topic_ventilation_command = "ventilation/command";
 const char* topic_ventilation_status = "ventilation/status";
 const char* ventilation_setpoints = "ventilation/setpoints";
 const char* ventilation_setpoints_get = "ventilation/setpoints/get";
-// const char* ventilation_command_manual = "ventilation/command/manual";
-// const char* ventilation_command_auto = "ventilation/command/auto";
+const char* ventilation_command_manual = "ventilation/command/manual";
+const char* ventilation_command_auto = "ventilation/command/auto";
 
 //Cooling Topics 
 const char* topic_cooling_command = "cooling/command";
@@ -85,7 +85,7 @@ float temperature = 0.0;
 float humidity    = 0.0;
 
 // Ventilation System Variables
-const char* ventilationStatus = "closed";
+String ventilationStatus = "stopped";
 float ventilation_temperature_setpoint = 26.0;
 bool ventilation_control_auto_state = false;
 unsigned long ventilation_open_coefficient = 500;
@@ -105,8 +105,8 @@ float cooling_emergency_off_temperature = 0;
 bool cooling_control_auto_state = false;
 bool cooling_system_active = false;
 bool cooling_water_pump_status = false;
-int cooling_ventilators_count = 0;
-bool cooling_ventilators_status[];
+int cooling_ventilators_count = 4;
+bool cooling_ventilators_status[4] = {false, false, false, false};
 
 
 
@@ -139,6 +139,7 @@ void setup() {
   // Restore saved values
   // Ventilation
   ventilation_temperature_setpoint = preferences.getFloat("temp_setpoint", 20.0); // Default 26.0
+  ventilationStatus = preferences.getString("ventilation_status", "stopped");
   current_ventilation_percent = preferences.getInt("vent_percent", 0); // Default 0%
   ventilation_control_auto_state = preferences.getBool("auto_control", false); // Default false
   ventilation_wind_speed_setpoint = preferences.getInt("wind_speed", 0); // Default 0%
@@ -151,12 +152,14 @@ void setup() {
   cooling_ventilators_count = preferences.getInt("cooling_ventilators_count", 0); // Default 0
 
   for (int i = 0; i < cooling_ventilators_count; i++) {
-    cooling_ventilators_status[i] = preferences.getBool("v" + String(i+1), false);
+    String vKey = "v" + String(i + 1);
+    cooling_ventilators_status[i] = preferences.getBool(vKey.c_str(), false);
   }
 
 
   for (int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++) {
-    relayStatus[i] = preferences.getBool("relay" + String(i+1), false);
+    String rKey = "relay" + String(i + 1);
+    relayStatus[i] = preferences.getBool(rKey.c_str(), false);
   }
 
 
@@ -186,6 +189,10 @@ void loop() {
     reconnectMQTT();
   }
   mqttClient.loop();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
+  }
 
 if (ventilation_in_progress && (millis() - ventilation_start_time >= ventilation_open_duration)) {
   ventilation_control_stop();
@@ -228,10 +235,10 @@ void setup_wifi() {
 
   // Wait for connection with timeout
   int timeout_counter = 0;
-  while (WiFi.status() != WL_CONNECTED && timeout_counter < 50) {
+  while (WiFi.status() != WL_CONNECTED /*&& timeout_counter < 50*/) {
     delay(500);
     Serial.print(".");
-    timeout_counter++;
+    // timeout_counter++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -267,6 +274,8 @@ void reconnectMQTT() {
       mqttClient.subscribe(topic_ventilation_status); 
       mqttClient.subscribe(ventilation_setpoints);
       mqttClient.subscribe(ventilation_setpoints_get);
+      mqttClient.subscribe(ventilation_command_manual);
+      mqttClient.subscribe(ventilation_command_auto);
       // Cooling
       mqttClient.subscribe(topic_cooling_command);
       mqttClient.subscribe(topic_cooling_status);
@@ -426,6 +435,15 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   else if (topicStr == ventilation_setpoints_get && actionStr == "get") {
     publishVentilationSetpoints();
   }
+  else if (topicStr == ventilation_command_manual) {
+    ventilation_control_auto_state = false;
+    saveVentilationSettings();
+  }
+  else if (topicStr == ventilation_command_auto) {
+    ventilation_control_auto_state = true;
+    ventilation_control_auto();
+    saveVentilationSettings();
+  }
 
   // Cooling
   else if (topicStr == topic_cooling_setpoints_get && actionStr == "get") {
@@ -539,6 +557,24 @@ void sendMQTTMessage(const char* topic, const char* message) {
   mqttClient.publish(topic, message, true);
 }
 
+// Функция для вычисления CRC16 Modbus
+uint16_t ModbusCRC16(byte* buf, int len) {
+  uint16_t crc = 0xFFFF;
+  
+  for (int pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];  // XOR байта с текущим значением CRC
+    
+    for (int i = 8; i != 0; i--) {  // Для каждого бита в байте
+      if ((crc & 0x0001) != 0) {    // Если младший бит = 1
+        crc >>= 1;                  // Сдвиг вправо на 1 бит
+        crc ^= 0xA001;              // XOR с полиномом 0xA001
+      } else {                      // Иначе если младший бит = 0
+        crc >>= 1;                  // Просто сдвигаем вправо
+      }
+    }
+  }
+  return crc;
+}
 
 // Улучшенная функция проверки статуса реле, соответствующая документации Waveshare
 bool getRelayStatus(uint8_t relayNum) {
@@ -727,33 +763,12 @@ void turnOffRelay(int relayNum) {
   }
 }
 
-// Тестовая функция для улучшенной версии
-void testEnhancedFunctions() {
-  Serial.println("Testing enhanced relay functions...");
-  
-  // Проверка статуса реле 1
-  Serial.println("Reading status of relay 1...");
-  getRelayStatus(1);
-  delay(1000);
-  
-  // Включение реле 1
-  Serial.println("Turning ON relay 1...");
-  turnOnRelay(1);
-  delay(1000);
-  
-  // Выключение реле 1
-  Serial.println("Turning OFF relay 1...");
-  turnOffRelay(1);
-  delay(1000);
-  
-  Serial.println("Enhanced test completed");
-}
 
 // Function to save relay state
 void saveRelayState() {
     for(int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++){
-    String key = "relay" + String(i+1);
-    preferences.putBool(key.c_str(), relayStatus[i]);
+    String rKey = "relay" + String(i + 1);
+    preferences.putBool(rKey.c_str(), relayStatus[i]);
   }
   // String key = "relay" + String(relayNum);
   // preferences.putBool(key.c_str(), state);
@@ -854,24 +869,6 @@ bool readSHT20Data() {
 }
 
 
-// Функция для вычисления CRC16 Modbus
-uint16_t ModbusCRC16(byte* buf, int len) {
-  uint16_t crc = 0xFFFF;
-  
-  for (int pos = 0; pos < len; pos++) {
-    crc ^= (uint16_t)buf[pos];  // XOR байта с текущим значением CRC
-    
-    for (int i = 8; i != 0; i--) {  // Для каждого бита в байте
-      if ((crc & 0x0001) != 0) {    // Если младший бит = 1
-        crc >>= 1;                  // Сдвиг вправо на 1 бит
-        crc ^= 0xA001;              // XOR с полиномом 0xA001
-      } else {                      // Иначе если младший бит = 0
-        crc >>= 1;                  // Просто сдвигаем вправо
-      }
-    }
-  }
-  return crc;
-}
 
 
 
@@ -898,6 +895,7 @@ void publishSHT20Data(){
 // Publish status of all relays
 void publishAllRelayStatus() {
   StaticJsonDocument<200> doc;
+
   doc["r1"] = relayStatus[0] ? "ON" : "OFF";
   doc["r2"] = relayStatus[1] ? "ON" : "OFF";
   doc["r3"] = relayStatus[2] ? "ON" : "OFF";
@@ -968,29 +966,29 @@ void publishRelayStatus(int relayIndex) {
 
 //Ventilation System
 void ventilation_control_open(){
-  turnOnRelay(4);
-  if(relayStatus[3] == true){
-    ventilationStatus = "open";
+  turnOnRelay(2);
+  if(relayStatus[1] == true){
+    ventilationStatus = "opening";
     current_ventilation_percent = 100;
   }else{
-    ventilationStatus = "open_error";
+    ventilationStatus = "opening_error";
   }
 }
 
 void ventilation_control_close(){
   turnOnRelay(3);
   if(relayStatus[2] == true){
-    ventilationStatus = "closed";
+    ventilationStatus = "closing";
     current_ventilation_percent = 0;
   }else{
-    ventilationStatus = "closed_error";
+    ventilationStatus = "closing_error";
   }
 }
 
 void ventilation_control_stop(){
+  turnOffRelay(2);
   turnOffRelay(3);
-  turnOffRelay(4);
-  if(relayStatus[2] == false && relayStatus[3] == false){
+  if(relayStatus[1] == false && relayStatus[2] == false){
     ventilationStatus = "stopped";
     current_ventilation_percent = ventilation_percent_target;
   }else{
@@ -1032,6 +1030,7 @@ void ventilation_control_open_percent(int target_percent) {
       Serial.println("Ventilation closing from " + String(current_ventilation_percent) + 
                     "% to " + String(target_percent) + "% (Moving " + 
                     String(abs(relative_change)) + "%)");
+      ventilationStatus = "closing";
       // Partial close
       ventilation_control_close(); // Start closing motor
       // Set up variables for non-blocking operation
@@ -1044,6 +1043,7 @@ void ventilation_control_open_percent(int target_percent) {
       Serial.println("Ventilation opening from " + String(current_ventilation_percent) + 
                     "% to " + String(target_percent) + "% (Moving " + 
                     String(abs(relative_change)) + "%)");
+      ventilationStatus = "opening";
       // Partial open
       ventilation_control_open(); // Start opening motor
       // Set up variables for non-blocking operation
@@ -1069,37 +1069,19 @@ void publishVentilationStatus(){
   sendMQTTData(topic_ventilation_status, buffer);
 }
 
-// void ventilation_control_auto(){
-//   if(ventilation_control_auto_state){
-//       if(temperature > ventilation_temperature_setpoint){
-//         if(ventilationStatus == "closed"){
-//           Serial.println("Temp is Hight Turning Opening ventilation");
-//           ventilation_control_open_percent(25);
-//       }else {
-//         Serial.println("Temp is Hight but Ventilation turned on Du nothing");
-//        }
-//     }else if(temperature < ventilation_temperature_setpoint){
-//       if(ventilationStatus == "open"){
-//         Serial.println("Temp is Low Turning closing ventilation");
-//         Serial.println(temperature);
-//         Serial.println(ventilation_temperature_setpoint);
-//         ventilation_control_close();
-//       }else {
-//         Serial.println("Temp is low but Ventilation turned off Du nothing");
-//        }
-//     }
-//   }
-// } 
 
 void ventilation_control_auto(){
+  float plus_2 = ventilation_temperature_setpoint + 2;
+  float plus_4 = ventilation_temperature_setpoint + 4;
+  float plus_6 = ventilation_temperature_setpoint + 6;
   if(ventilation_control_auto_state){
-    if(temperature > ventilation_temperature_setpoint && ventilationStatus == "closed" || ventilationStatus == "stopped"){
+    if(temperature > ventilation_temperature_setpoint && temperature < plus_2 && ventilationStatus == "stopped" ){
       ventilation_control_open_percent(25);
-    }else if(temperature > ventilation_temperature_setpoint + 2){
+    }else if(temperature > plus_2 && temperature < plus_4 && ventilationStatus == "stopped" ){
       ventilation_control_open_percent(50);
-    }else if(temperature > ventilation_temperature_setpoint + 4){
+    }else if(temperature > plus_4 && temperature < plus_6 && ventilationStatus == "stopped" ){
       ventilation_control_open_percent(75);
-    }else if(temperature > ventilation_temperature_setpoint + 6){
+    }else if(temperature > plus_6 &&  ventilationStatus == "stopped" ){
       ventilation_control_open_percent(100);
     }else if(temperature < ventilation_temperature_setpoint){
       ventilation_control_open_percent(0);
@@ -1148,9 +1130,9 @@ void publishVentilationSetpoints(){
 
 
 void startVentilator(int ventilatorIndex) {
-  if(ventilatorIndex >= 1 && ventilatorIndex <= 4){
+  if(ventilatorIndex >= 1 && ventilatorIndex <= cooling_ventilators_count){
     // Вентилятор 1 = реле 5, вентилятор 2 = реле 6, и т.д.
-    int relayIndex = ventilatorIndex + 3;
+    int relayIndex = ventilatorIndex + 2;
     turnOnRelay(relayIndex);
     delay(100);
     if(relayStatus[relayIndex-1]){ // Массив relayStatus индексируется с 0
@@ -1168,9 +1150,9 @@ void startVentilator(int ventilatorIndex) {
 }
 
 void stopVentilator(int ventilatorIndex) {
-  if(ventilatorIndex >= 1 && ventilatorIndex <= 4){
+  if(ventilatorIndex >= 1 && ventilatorIndex <= cooling_ventilators_count){
     // Вентилятор 1 = реле 5, вентилятор 2 = реле 6, и т.д.
-    int relayIndex = ventilatorIndex + 3;
+    int relayIndex = ventilatorIndex + 2;
     turnOffRelay(relayIndex);
     delay(100);
     if(!relayStatus[relayIndex-1]){ // Проверяем, что реле действительно выключено
@@ -1225,8 +1207,8 @@ void saveCoolingSettings() {
   preferences.putBool("cooling_control_auto_state", cooling_control_auto_state);
   preferences.putBool("cooling_system_active", cooling_system_active);
   for(int i = 0; i < sizeof(cooling_ventilators_status)/sizeof(cooling_ventilators_status[0]); i++){
-    String key = "v" + String(i+1);
-    preferences.putBool(key.c_str(), cooling_ventilators_status[i]);
+    String vKey = "v" + String(i + 1);
+    preferences.putBool(vKey.c_str(), cooling_ventilators_status[i]);
   }
   preferences.putBool("cooling_water_pump_status", cooling_water_pump_status);
 }
