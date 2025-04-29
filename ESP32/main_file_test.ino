@@ -44,9 +44,12 @@ const char* topic_bmp280 = "sensors/bmp280";
 const char* topic_bmp280_read = "sensors/bmp280/read";
 const char* topic_ldr = "sensors/ldr";
 const char* topic_ldr_read = "sensors/ldr/read";
-const char* topic_relay_command = "relay/command";
+
+const char* topic_relay_command_on = "relay/command/on";
+const char* topic_relay_command_off = "relay/command/off";
 const char* topic_relay_status = "relay/status";
 const char* topic_relay_status_get = "relay/status/get";
+
 const char* topic_greenhouse_status = "greenhouse/status";
 const char* topic_greenhouse_status_get = "greenhouse/status/get";
 
@@ -266,8 +269,11 @@ void reconnectMQTT() {
       mqttClient.subscribe(topic_sht20_read);
       mqttClient.subscribe(topic_bmp280_read);
       mqttClient.subscribe(topic_ldr_read);
-      mqttClient.subscribe(topic_relay_command);
+
+      mqttClient.subscribe(topic_relay_command_on);
+      mqttClient.subscribe(topic_relay_command_off);
       mqttClient.subscribe(topic_relay_status_get);
+
       mqttClient.subscribe(topic_greenhouse_status_get);
       // Ventilation
       mqttClient.subscribe(topic_ventilation_command);
@@ -402,10 +408,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   else if (topicStr == topic_ldr_read && actionStr == "request") {
     // publishLDRData();
   }
-    // Handle relay commands
-  else if (topicStr == topic_relay_command) {
-    handleRelayCommand(actionStr);
-  }
+
 
   // Ventilation
   else if (topicStr == topic_ventilation_command) {
@@ -475,54 +478,38 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     saveCoolingSettings();
   }
 
+      // Handle relay commands
+  else if (topicStr == topic_relay_command_on) {
+    handleRelayCommand(actionValue, "ON");
+  }
+  else if (topicStr == topic_relay_command_off) {
+    handleRelayCommand(actionValue, "OFF");
+  }
+
+
   // Handle status requests
   else if (topicStr == topic_relay_status_get) {
     if (actionStr == "all") {
       publishAllRelayStatus();
     } else {
-      // Check if it's a specific relay request
-      if (actionStr == "r1") publishRelayStatus(1);
-      else if (actionStr == "r2") publishRelayStatus(2);
-      else if (actionStr == "r3") publishRelayStatus(3);
-      else if (actionStr == "r4") publishRelayStatus(4);
+      publishRelayStatus(actionValue);
     }
   }
 }
 
 // Handle relay command
-void handleRelayCommand(String command) {
-  uint8_t relayIndex = 1;
+void handleRelayCommand(int relayIndex, String commandType) {
   bool turnOn = true;
-  
-  // Extract relay index (1-based in command, 0-based in array)
-  if (command.startsWith("r1")) {
-    relayIndex = 1;
-  } else if (command.startsWith("r2")) {
-    relayIndex = 2;
-  } else if (command.startsWith("r3")) {
-    relayIndex = 3;
-  } else if (command.startsWith("r4")) {
-    relayIndex = 4;
-  }
   
   
   // Check if this is an OFF command
-  if (command.endsWith("_OFF")) {
+  if (commandType == "OFF") {
     turnOn = false;
   }
-  
+
   // Apply the command if valid
   if (relayIndex >= 0) {
-    // Get physical pin
-    // int pin;
-    // switch (relayIndex) {
-    //   case 0: pin = RELAY1_PIN; break;
-    //   case 1: pin = RELAY2_PIN; break;
-    //   case 2: pin = RELAY3_PIN; break;
-    //   case 3: pin = RELAY4_PIN; break;
-    // }
-    
-    // Set pin state
+
     if(turnOn){
       turnOnRelay(relayIndex);
     }
@@ -548,14 +535,9 @@ void sendMQTTData(const char* topic, const char* data) {
     reconnectMQTT();
   }
   mqttClient.publish(topic, data);
+  Serial.println("MQTT data sent");
 };
 
-void sendMQTTMessage(const char* topic, const char* message) {
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-  }
-  mqttClient.publish(topic, message, true);
-}
 
 // Функция для вычисления CRC16 Modbus
 uint16_t ModbusCRC16(byte* buf, int len) {
@@ -646,14 +628,12 @@ bool getRelayStatus(uint8_t relayNum) {
 }
 
 
-
-
-
-
-
 // Модифицируем turnOnRelay для использования улучшенной функции проверки статуса
 void turnOnRelay(int relayNum) {
-  if (relayNum < 1 || relayNum > 32) return;
+    if (relayNum < 1 || relayNum > 32) {
+    Serial.println("Error: Relay number relayNum=" + String(relayNum) + " out of range (1-32) Relay Turn On failed");
+    return; 
+  }
   
   // Отправляем команду включения
   byte commandOn[8];
@@ -697,7 +677,7 @@ void turnOnRelay(int relayNum) {
   
   // Проверяем фактический статус реле с помощью улучшенной функции
   bool actualStatus = getRelayStatus(relayNum);
-  
+  relayStatus[relayNum - 1] = actualStatus;
   // Выводим результат сравнения ожидаемого и фактического статуса
   if (actualStatus) {
     Serial.println("Relay is verified to be ON");
@@ -708,7 +688,10 @@ void turnOnRelay(int relayNum) {
 
 // Модифицируем turnOffRelay для использования улучшенной функции проверки статуса
 void turnOffRelay(int relayNum) {
-  if (relayNum < 1 || relayNum > 32) return;
+  if (relayNum < 1 || relayNum > 32) {
+    Serial.println("Error: Relay number relayNum=" + String(relayNum) + " out of range (1-32) Relay Turn Off failed");
+    return;
+  }
   
   // Отправляем команду выключения
   byte commandOff[8];
@@ -754,6 +737,7 @@ void turnOffRelay(int relayNum) {
   
   // Проверяем фактический статус реле с помощью улучшенной функции
   bool actualStatus = getRelayStatus(relayNum);
+  relayStatus[relayNum - 1] = actualStatus;
   
   // Выводим результат сравнения ожидаемого и фактического статуса
   if (!actualStatus) {
@@ -766,12 +750,10 @@ void turnOffRelay(int relayNum) {
 
 // Function to save relay state
 void saveRelayState() {
-    for(int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++){
+  for(int i = 0; i < sizeof(relayStatus)/sizeof(relayStatus[0]); i++){
     String rKey = "relay" + String(i + 1);
     preferences.putBool(rKey.c_str(), relayStatus[i]);
   }
-  // String key = "relay" + String(relayNum);
-  // preferences.putBool(key.c_str(), state);
 }
 
 
@@ -870,12 +852,6 @@ bool readSHT20Data() {
 
 
 
-
-
-
-
-
-
 void publishSHT20Data(){
   readSHT20Data();
   StaticJsonDocument<200> doc;
@@ -894,46 +870,35 @@ void publishSHT20Data(){
 
 // Publish status of all relays
 void publishAllRelayStatus() {
-  StaticJsonDocument<200> doc;
+  // Send in batches of 8 relays to avoid exceeding message size limits
+  sendRelayBatch(1, 8);
+  delay(100);
+  sendRelayBatch(9, 16);
+  delay(100);
+  sendRelayBatch(17, 24);
+  delay(100);
+  sendRelayBatch(25, 32);
+}
 
-  doc["r1"] = relayStatus[0] ? "ON" : "OFF";
-  doc["r2"] = relayStatus[1] ? "ON" : "OFF";
-  doc["r3"] = relayStatus[2] ? "ON" : "OFF";
-  doc["r4"] = relayStatus[3] ? "ON" : "OFF";
-  doc["r5"] = relayStatus[4] ? "ON" : "OFF";
-  doc["r6"] = relayStatus[5] ? "ON" : "OFF";
-  doc["r7"] = relayStatus[6] ? "ON" : "OFF";
-  doc["r8"] = relayStatus[7] ? "ON" : "OFF";
-  doc["r9"] = relayStatus[8] ? "ON" : "OFF";
-  doc["r10"] = relayStatus[9] ? "ON" : "OFF";
-  doc["r11"] = relayStatus[10] ? "ON" : "OFF";
-  doc["r12"] = relayStatus[11] ? "ON" : "OFF";
-  doc["r13"] = relayStatus[12] ? "ON" : "OFF";
-  doc["r14"] = relayStatus[13] ? "ON" : "OFF";
-  doc["r15"] = relayStatus[14] ? "ON" : "OFF";
-  doc["r16"] = relayStatus[15] ? "ON" : "OFF";
-  doc["r17"] = relayStatus[16] ? "ON" : "OFF";
-  doc["r18"] = relayStatus[17] ? "ON" : "OFF";
-  doc["r19"] = relayStatus[18] ? "ON" : "OFF";
-  doc["r20"] = relayStatus[19] ? "ON" : "OFF";
-  doc["r21"] = relayStatus[20] ? "ON" : "OFF";
-  doc["r22"] = relayStatus[21] ? "ON" : "OFF";
-  doc["r23"] = relayStatus[22] ? "ON" : "OFF";
-  doc["r24"] = relayStatus[23] ? "ON" : "OFF";
-  doc["r25"] = relayStatus[24] ? "ON" : "OFF";
-  doc["r26"] = relayStatus[25] ? "ON" : "OFF";
-  doc["r27"] = relayStatus[26] ? "ON" : "OFF";
-  doc["r28"] = relayStatus[27] ? "ON" : "OFF";
-  doc["r29"] = relayStatus[28] ? "ON" : "OFF";
-  doc["r30"] = relayStatus[29] ? "ON" : "OFF";
-  doc["r31"] = relayStatus[30] ? "ON" : "OFF";
-  doc["r32"] = relayStatus[31] ? "ON" : "OFF";
+// Helper function to send relays in smaller batches
+void sendRelayBatch(int startRelay, int endRelay) {
+  StaticJsonDocument<256> doc;
+  
+  for (int i = startRelay; i <= endRelay; i++) {
+    doc[String(i)] = relayStatus[i-1] ? "ON" : "OFF";
+  }
   doc["greenhouse_id"] = greenhouse_id;
   
-  char buffer[200];
+  char buffer[256];
   serializeJson(doc, buffer);
   
-  // Publish
+  Serial.print("Publishing relay batch ");
+  Serial.print(startRelay);
+  Serial.print("-");
+  Serial.print(endRelay);
+  Serial.print(". Size: ");
+  Serial.println(strlen(buffer));
+  
   sendMQTTData(topic_relay_status, buffer);
 }
 
@@ -943,7 +908,7 @@ void publishRelayStatus(int relayIndex) {
   
   String state;
 
-  String relayId = "r" + String(relayIndex);
+  String relayId = String(relayIndex);
 
   if(getRelayStatus(relayIndex)){
     state = "ON";
@@ -951,9 +916,9 @@ void publishRelayStatus(int relayIndex) {
     state = "OFF";
   }
 
-  
   StaticJsonDocument<100> doc;
-  doc[relayId] = state;
+  doc["relay_id"] = relayId;
+  doc["state"] = state;
   doc["greenhouse_id"] = greenhouse_id;
   
   char buffer[100];
@@ -964,12 +929,14 @@ void publishRelayStatus(int relayIndex) {
 } 
 
 
+
 //Ventilation System
+
+
 void ventilation_control_open(){
   turnOnRelay(2);
   if(relayStatus[1] == true){
     ventilationStatus = "opening";
-    current_ventilation_percent = 100;
   }else{
     ventilationStatus = "opening_error";
   }
@@ -979,7 +946,6 @@ void ventilation_control_close(){
   turnOnRelay(3);
   if(relayStatus[2] == true){
     ventilationStatus = "closing";
-    current_ventilation_percent = 0;
   }else{
     ventilationStatus = "closing_error";
   }
